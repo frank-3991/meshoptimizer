@@ -564,6 +564,29 @@ MESHOPTIMIZER_API size_t meshopt_simplifyWithAttributes(unsigned int* destinatio
 MESHOPTIMIZER_API size_t meshopt_simplifyWithUpdate(unsigned int* indices, size_t index_count, float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, float* vertex_attributes, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* result_error);
 
 /**
+ * Mesh simplifier with attribute and material boundary awareness
+ * Reduces the number of triangles in the mesh, attempting to preserve mesh appearance as much as possible.
+ * Similar to meshopt_simplify, but incorporates normal and texture coordinate values into the error metric used to prioritize simplification order, and locks edges between triangles with different materials so that simplification never crosses material (visual seam) boundaries.
+ * The algorithm tries to preserve mesh topology and can stop short of the target goal based on topology constraints or target error.
+ * Returns the number of indices after simplification, with destination containing new index data
+ *
+ * The resulting index buffer references vertices from the original vertex buffer.
+ * If the original vertex data isn't needed, creating a compact vertex buffer using meshopt_optimizeVertexFetch is recommended.
+ * The simplification is deterministic: the same input data and constraints always produce the same resulting index buffer.
+ *
+ * destination must contain enough space for the target index buffer, worst case is index_count elements (*not* target_index_count)!
+ * vertex_positions should have float3 position in the first 12 bytes of each vertex
+ * vertex_normals can be NULL; when it's not NULL, it should have float3 normal in the first 12 bytes of each vertex
+ * vertex_texcoords can be NULL; when it's not NULL, it should have float2 texture coordinate in the first 8 bytes of each vertex
+ * face_materials can be NULL; when it's not NULL, it should have one material index per triangle (index_count / 3 elements); vertices on edges between triangles with different materials are locked in place
+ * normal_weight and texcoord_weight determine relative priority of normals and texture coordinates wrt position; 1.0 is a safe default
+ * target_error represents the error relative to mesh extents that can be tolerated, e.g. 0.01 = 1% deformation (unless absolute error option is used)
+ * options must be a bitmask composed of meshopt_SimplifyX options; 0 is a safe default
+ * result_error can be NULL; when it's not NULL, it will contain the resulting (relative/absolute) error after simplification
+ */
+MESHOPTIMIZER_API size_t meshopt_simplifyWithMaterials(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_normals, size_t vertex_normals_stride, const float* vertex_texcoords, size_t vertex_texcoords_stride, const unsigned int* face_materials, float normal_weight, float texcoord_weight, size_t target_index_count, float target_error, unsigned int options, float* result_error);
+
+/**
  * Mesh simplifier (sloppy)
  * Reduces the number of triangles in the mesh, sacrificing mesh appearance for simplification performance
  * The algorithm doesn't preserve mesh topology but can stop short of the target goal based on target error.
@@ -1138,6 +1161,8 @@ inline size_t meshopt_simplifyWithAttributes(T* destination, const T* indices, s
 template <typename T>
 inline size_t meshopt_simplifyWithUpdate(T* indices, size_t index_count, float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, float* vertex_attributes, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options = 0, float* result_error = NULL);
 template <typename T>
+inline size_t meshopt_simplifyWithMaterials(T* destination, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_normals, size_t vertex_normals_stride, const float* vertex_texcoords, size_t vertex_texcoords_stride, const unsigned int* face_materials, float normal_weight, float texcoord_weight, size_t target_index_count, float target_error, unsigned int options = 0, float* result_error = NULL);
+template <typename T>
 inline size_t meshopt_simplifySloppy(T* destination, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t target_index_count, float target_error, float* result_error = NULL);
 template <typename T>
 inline size_t meshopt_simplifySloppy(T* destination, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* result_error = NULL);
@@ -1548,6 +1573,15 @@ inline size_t meshopt_simplifyWithUpdate(T* indices, size_t index_count, float* 
 	meshopt_IndexAdapter<T> inout(indices, indices, index_count);
 
 	return meshopt_simplifyWithUpdate(inout.data, index_count, vertex_positions, vertex_count, vertex_positions_stride, vertex_attributes, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options, result_error);
+}
+
+template <typename T>
+inline size_t meshopt_simplifyWithMaterials(T* destination, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_normals, size_t vertex_normals_stride, const float* vertex_texcoords, size_t vertex_texcoords_stride, const unsigned int* face_materials, float normal_weight, float texcoord_weight, size_t target_index_count, float target_error, unsigned int options, float* result_error)
+{
+	meshopt_IndexAdapter<T> in(NULL, indices, index_count);
+	meshopt_IndexAdapter<T> out(destination, NULL, index_count);
+
+	return meshopt_simplifyWithMaterials(out.data, in.data, index_count, vertex_positions, vertex_count, vertex_positions_stride, vertex_normals, vertex_normals_stride, vertex_texcoords, vertex_texcoords_stride, face_materials, normal_weight, texcoord_weight, target_index_count, target_error, options, result_error);
 }
 
 template <typename T>

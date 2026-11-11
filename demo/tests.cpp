@@ -2469,6 +2469,173 @@ static void simplifySeamAttr()
 	assert(fabsf(error - 0.35f) < 0.01f);
 }
 
+static void simplifyMaterials()
+{
+	// 4x4 vertex grid: position (x, y, 0), normal (0, 0, 1), uv (x/3, y/3)
+	float vb[16 * 8];
+	for (int y = 0; y < 4; ++y)
+		for (int x = 0; x < 4; ++x)
+		{
+			float* v = vb + (y * 4 + x) * 8;
+			v[0] = float(x);
+			v[1] = float(y);
+			v[2] = 0.f;
+			v[3] = 0.f;
+			v[4] = 0.f;
+			v[5] = 1.f;
+			v[6] = x / 3.f;
+			v[7] = y / 3.f;
+		}
+
+	// 3x3 quads; quads left of the x=1 vertex column use material 0, the rest use material 1
+	unsigned int ib[18 * 3];
+	unsigned int mats[18];
+	for (int y = 0; y < 3; ++y)
+		for (int x = 0; x < 3; ++x)
+		{
+			unsigned int q = y * 3 + x;
+			unsigned int v0 = y * 4 + x, v1 = v0 + 1, v2 = v0 + 4, v3 = v0 + 5;
+			ib[q * 6 + 0] = v0;
+			ib[q * 6 + 1] = v1;
+			ib[q * 6 + 2] = v2;
+			ib[q * 6 + 3] = v2;
+			ib[q * 6 + 4] = v1;
+			ib[q * 6 + 5] = v3;
+			mats[q * 2 + 0] = mats[q * 2 + 1] = (x == 0) ? 0 : 1;
+		}
+
+	unsigned int res1[18 * 3];
+	float error = 0.f;
+
+	// vertices on the material boundary (x=1 column) are locked, so simplification can't cross the boundary
+	size_t r1 = meshopt_simplifyWithMaterials(res1, ib, 18 * 3, vb, 16, 32, vb + 3, 32, vb + 6, 32, mats, 1.f, 1.f, 0, 1.f, 0, &error);
+	assert(r1 == 18);
+	for (int k = 0; k < 4; ++k)
+	{
+		bool found = false;
+		for (size_t i = 0; i < r1; ++i)
+			found = found || res1[i] == unsigned(1 + 4 * k);
+		assert(found);
+	}
+
+	// without materials the same mesh collapses completely
+	unsigned int res[18 * 3];
+	float error_nomats = 0.f;
+	assert(meshopt_simplifyWithMaterials(res, ib, 18 * 3, vb, 16, 32, vb + 3, 32, vb + 6, 32, NULL, 1.f, 1.f, 0, 1.f, 0, &error_nomats) == 0);
+
+	// repeated runs with the same input and constraints produce identical indices and error
+	unsigned int res2[18 * 3];
+	float error2 = 0.f;
+	size_t r3 = meshopt_simplifyWithMaterials(res2, ib, 18 * 3, vb, 16, 32, vb + 3, 32, vb + 6, 32, mats, 1.f, 1.f, 0, 1.f, 0, &error2);
+	assert(r3 == r1);
+	assert(memcmp(res1, res2, r1 * sizeof(unsigned int)) == 0);
+	assert(error == error2);
+
+	// without attributes and materials the result matches the position-only simplifier exactly
+	unsigned int res3[18 * 3], res4[18 * 3];
+	float error3 = 0.f, error4 = 0.f;
+	size_t r4 = meshopt_simplifyWithMaterials(res3, ib, 18 * 3, vb, 16, 32, NULL, 0, NULL, 0, NULL, 1.f, 1.f, 12, 1.f, 0, &error3);
+	size_t r5 = meshopt_simplify(res4, ib, 18 * 3, vb, 16, 32, 12, 1.f, 0, &error4);
+	assert(r4 == r5);
+	assert(memcmp(res3, res4, r4 * sizeof(unsigned int)) == 0);
+	assert(error3 == error4);
+}
+
+static void simplifyMaterialsNormals()
+{
+	// 3-column strip (x = 0, 1, 4) with the middle row duplicated at y=1; each column has a distinct normal, creating attribute seams between columns
+	float vb[12 * 8];
+	const float xs[12] = {0, 0, 0, 0, 1, 1, 1, 1, 4, 4, 4, 4};
+	const float ys[12] = {0, 1, 1, 2, 0, 1, 1, 2, 0, 1, 1, 2};
+	const float ns[3][3] = {{0, 0, 1}, {1, 0, 0}, {0, 0, 1}};
+	for (int i = 0; i < 12; ++i)
+	{
+		float* v = vb + i * 8;
+		int c = xs[i] == 0 ? 0 : (xs[i] == 1 ? 1 : 2);
+		v[0] = xs[i];
+		v[1] = ys[i];
+		v[2] = 0.f;
+		v[3] = ns[c][0];
+		v[4] = ns[c][1];
+		v[5] = ns[c][2];
+		v[6] = xs[i] / 4.f;
+		v[7] = ys[i] / 2.f;
+	}
+
+	unsigned int ib[] = {
+	    0, 1, 4,
+	    4, 1, 5,
+	    2, 3, 6,
+	    6, 3, 7,
+	    4, 5, 8,
+	    8, 5, 9,
+	    6, 7, 10,
+	    10, 7, 11 //
+	};
+
+	unsigned int res[24];
+	float error = 0.f;
+
+	// with a tight error budget, the normal seam prevents any simplification
+	assert(meshopt_simplifyWithMaterials(res, ib, 24, vb, 12, 32, vb + 3, 32, vb + 6, 32, NULL, 1.f, 1.f, 0, 1e-2f, 0, &error) == 24);
+
+	// with uniform normals the same mesh simplifies within the same budget
+	float ub[12 * 8];
+	memcpy(ub, vb, sizeof(ub));
+	for (int i = 0; i < 12; ++i)
+	{
+		ub[i * 8 + 3] = 0.f;
+		ub[i * 8 + 4] = 0.f;
+		ub[i * 8 + 5] = 1.f;
+	}
+	assert(meshopt_simplifyWithMaterials(res, ib, 24, ub, 12, 32, ub + 3, 32, ub + 6, 32, NULL, 1.f, 1.f, 0, 1e-2f, 0, &error) == 12);
+
+	// with locked borders, vertices on both the normal seam and the border are preserved
+	size_t r = meshopt_simplifyWithMaterials(res, ib, 24, vb, 12, 32, vb + 3, 32, vb + 6, 32, NULL, 1.f, 1.f, 0, 2.f, meshopt_SimplifyLockBorder, &error);
+	assert(r == 18);
+	for (int k = 0; k < 4; ++k)
+	{
+		unsigned int sv = k < 2 ? 1 + k : 9 + (k - 2); // 1, 2, 9, 10
+		bool found = false;
+		for (size_t i = 0; i < r; ++i)
+			found = found || res[i] == sv;
+		assert(found);
+	}
+}
+
+static void simplifyMaterialsDegenerate()
+{
+	// xyz+normal+uv
+	float vb[3 * 8] = {
+	    0, 0, 0, 0, 0, 1, 0, 0,
+	    1, 0, 0, 0, 0, 1, 1, 0,
+	    0, 1, 0, 0, 0, 1, 0, 1 //
+	};
+
+	// degenerate triangles are returned unchanged with zero error
+	unsigned int ib[] = {0, 0, 0, 1, 1, 1, 0, 1, 0};
+	unsigned int mats[] = {0, 1, 0};
+
+	unsigned int res[9];
+	float error = 1.f;
+	assert(meshopt_simplifyWithMaterials(res, ib, 9, vb, 3, 32, vb + 3, 32, vb + 6, 32, mats, 1.f, 1.f, 0, 1.f, 0, &error) == 9);
+	assert(memcmp(res, ib, sizeof(ib)) == 0);
+	assert(error == 0.f);
+
+	// empty input produces an empty result
+	error = 1.f;
+	assert(meshopt_simplifyWithMaterials(res, ib, 0, vb, 3, 32, vb + 3, 32, vb + 6, 32, mats, 1.f, 1.f, 0, 1.f, 0, &error) == 0);
+	assert(error == 0.f);
+
+	// a single point has zero extents; degenerate input is still handled
+	float pb[3] = {1, 2, 3};
+	unsigned int pib[] = {0, 0, 0};
+	unsigned int pm[] = {0};
+	error = 1.f;
+	assert(meshopt_simplifyWithMaterials(res, pib, 3, pb, 1, 12, NULL, 0, NULL, 0, pm, 1.f, 1.f, 0, 1.f, 0, &error) == 3);
+	assert(error == 0.f);
+}
+
 static void simplifyDebug()
 {
 	// 0
@@ -3696,6 +3863,9 @@ void runTests()
 	simplifySeam();
 	simplifySeamFake();
 	simplifySeamAttr();
+	simplifyMaterials();
+	simplifyMaterialsNormals();
+	simplifyMaterialsDegenerate();
 	simplifyDebug();
 	simplifyPrune();
 	simplifyPruneCleanup();

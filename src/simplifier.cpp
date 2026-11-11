@@ -2643,6 +2643,118 @@ size_t meshopt_simplifyWithUpdate(unsigned int* indices, size_t index_count, flo
 	return meshopt_simplifyEdge(indices, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, vertex_attributes_data, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options | meshopt_SimplifyInternalSolve, out_result_error);
 }
 
+size_t meshopt_simplifyWithMaterials(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_normals_data, size_t vertex_normals_stride, const float* vertex_texcoords_data, size_t vertex_texcoords_stride, const unsigned int* face_materials, float normal_weight, float texcoord_weight, size_t target_index_count, float target_error, unsigned int options, float* out_result_error)
+{
+	using namespace meshopt;
+
+	assert(index_count % 3 == 0);
+	assert(vertex_positions_stride >= 12 && vertex_positions_stride <= 256);
+	assert(vertex_positions_stride % sizeof(float) == 0);
+	assert(vertex_normals_data == NULL || (vertex_normals_stride >= 12 && vertex_normals_stride <= 256 && vertex_normals_stride % sizeof(float) == 0));
+	assert(vertex_texcoords_data == NULL || (vertex_texcoords_stride >= 8 && vertex_texcoords_stride <= 256 && vertex_texcoords_stride % sizeof(float) == 0));
+	assert(normal_weight >= 0.f && texcoord_weight >= 0.f);
+
+	meshopt_Allocator allocator;
+
+	// combine optional normals and texture coordinates into a single interleaved attribute stream
+	size_t attribute_count = (vertex_normals_data ? 3 : 0) + (vertex_texcoords_data ? 2 : 0);
+	float attribute_weights[3 + 2] = {normal_weight, normal_weight, normal_weight, texcoord_weight, texcoord_weight};
+	float* attributes = NULL;
+
+	if (attribute_count)
+	{
+		size_t normals_stride_float = vertex_normals_stride / sizeof(float);
+		size_t texcoords_stride_float = vertex_texcoords_stride / sizeof(float);
+
+		attributes = allocator.allocate<float>(vertex_count * attribute_count);
+
+		for (size_t i = 0; i < vertex_count; ++i)
+		{
+			float* va = attributes + i * attribute_count;
+
+			if (vertex_normals_data)
+				memcpy(va, vertex_normals_data + i * normals_stride_float, 3 * sizeof(float));
+
+			if (vertex_texcoords_data)
+				memcpy(va + (vertex_normals_data ? 3 : 0), vertex_texcoords_data + i * texcoords_stride_float, 2 * sizeof(float));
+		}
+	}
+
+	// lock vertices on edges between triangles with different materials so that collapses never cross material boundaries
+	unsigned char* locks = NULL;
+
+	if (face_materials)
+	{
+		size_t face_count = index_count / 3;
+
+		locks = allocator.allocate<unsigned char>(vertex_count);
+		memset(locks, 0, vertex_count);
+
+		// build half-edge adjacency that tracks the source face of each half-edge
+		unsigned int* offsets = allocator.allocate<unsigned int>(vertex_count + 1);
+		unsigned int* edge_faces = allocator.allocate<unsigned int>(index_count);
+		unsigned int* edge_next = allocator.allocate<unsigned int>(index_count);
+
+		unsigned int* counts = offsets + 1;
+		memset(counts, 0, vertex_count * sizeof(unsigned int));
+
+		for (size_t i = 0; i < index_count; ++i)
+		{
+			assert(indices[i] < vertex_count);
+			counts[indices[i]]++;
+		}
+
+		unsigned int offset = 0;
+
+		for (size_t i = 0; i < vertex_count; ++i)
+		{
+			unsigned int count = counts[i];
+			counts[i] = offset;
+			offset += count;
+		}
+
+		offsets[0] = 0;
+
+		for (size_t f = 0; f < face_count; ++f)
+		{
+			for (int e = 0; e < 3; ++e)
+			{
+				unsigned int a = indices[f * 3 + e], b = indices[f * 3 + (e + 1) % 3];
+
+				edge_next[counts[a]] = b;
+				edge_faces[counts[a]] = unsigned(f);
+				counts[a]++;
+			}
+		}
+
+		// an edge is a material boundary if the half-edge pair belongs to a face with a different material
+		for (size_t f = 0; f < face_count; ++f)
+		{
+			unsigned int material = face_materials[f];
+
+			for (int e = 0; e < 3; ++e)
+			{
+				unsigned int a = indices[f * 3 + e], b = indices[f * 3 + (e + 1) % 3];
+
+				if (a == b)
+					continue;
+
+				for (size_t i = offsets[b]; i < offsets[b + 1]; ++i)
+				{
+					if (edge_next[i] == a && face_materials[edge_faces[i]] != material)
+					{
+						locks[a] |= meshopt_SimplifyVertex_Lock;
+						locks[b] |= meshopt_SimplifyVertex_Lock;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	return meshopt_simplifyWithAttributes(destination, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, attributes, attribute_count * sizeof(float), attribute_weights, attribute_count, locks, target_index_count, target_error, options, out_result_error);
+}
+
 size_t meshopt_simplifySloppy(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* out_result_error)
 {
 	using namespace meshopt;

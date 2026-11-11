@@ -600,6 +600,21 @@ Including texture coordinates in the attribute set is optional, as simplificatio
 
 Both the target error and the resulting error combine positional error and attribute error, so the error can be used to control the LOD while taking attribute quality into account, assuming carefully chosen weights. When the error is used for LOD selection, enabling `meshopt_SimplifyErrorClamped` is recommended to avoid large attribute errors producing overly conservative LOD selection.
 
+### Material boundaries
+
+Meshes that use multiple materials often have visible seams along material transitions, so collapsing edges across these boundaries can change the appearance of the mesh even when positions and attributes are preserved. `meshopt_simplifyWithMaterials` is a convenience variant that combines position, normal and texture coordinate error with material boundary preservation in a single call:
+
+```c++
+std::vector<unsigned int> lod(index_count);
+float lod_error = 0.f;
+lod.resize(meshopt_simplifyWithMaterials(&lod[0], indices, index_count, &vertices[0].px, vertex_count, sizeof(Vertex),
+    &vertices[0].nx, sizeof(Vertex), &vertices[0].tx, sizeof(Vertex),
+    materials, /* normal_weight= */ 1.f, /* texcoord_weight= */ 1.f,
+    target_index_count, target_error, /* options= */ 0, &lod_error));
+```
+
+Normals and texture coordinates are optional and contribute to the error metric with the supplied weights when provided. `materials` should contain one material index per triangle; vertices on edges between triangles with different materials are locked in place, which guarantees that simplification never crosses material boundaries. Like other simplification functions, the algorithm is deterministic: the same input data and constraints always produce the same resulting index buffer.
+
 ### Permissive simplification
 
 By default, `meshopt_simplify` preserves attribute discontinuities inferred from the supplied index buffer. For meshes with many seams, the simplifier can get "stuck" and fail to fully simplify the mesh, as it cannot collapse vertices across attribute seams. This is especially problematic for meshes with faceted normals (flat shading), as the simplifier may not be able to reduce the triangle count at all. The `meshopt_SimplifyPermissive` option relaxes these restrictions, allowing the simplifier to collapse vertices across attribute discontinuities when the resulting error is acceptable:
