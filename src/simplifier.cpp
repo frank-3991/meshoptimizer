@@ -1829,15 +1829,43 @@ static void solveAttributes(Vector3* vertex_positions, float* vertex_attributes,
 	}
 }
 
-static size_t remapIndexBuffer(unsigned int* indices, size_t index_count, const unsigned int* collapse_remap, const unsigned int* remap)
+static unsigned int follow(unsigned int* parents, unsigned int index)
+{
+	while (index != parents[index])
+	{
+		unsigned int parent = parents[index];
+		parents[index] = parents[parent];
+		index = parent;
+	}
+
+	return index;
+}
+
+static void uniteProvenance(unsigned int* provenance, unsigned int lhs, unsigned int rhs)
+{
+	unsigned int lhs_root = follow(provenance, lhs);
+	unsigned int rhs_root = follow(provenance, rhs);
+
+	if (lhs_root != rhs_root)
+	{
+		unsigned int child = lhs_root < rhs_root ? rhs_root : lhs_root;
+		unsigned int parent = lhs_root < rhs_root ? lhs_root : rhs_root;
+		provenance[child] = parent;
+	}
+}
+
+static size_t remapIndexBuffer(unsigned int* indices, size_t index_count, const unsigned int* collapse_remap, const unsigned int* remap, unsigned int* provenance)
 {
 	size_t write = 0;
 
 	for (size_t i = 0; i < index_count; i += 3)
 	{
-		unsigned int v0 = collapse_remap[indices[i + 0]];
-		unsigned int v1 = collapse_remap[indices[i + 1]];
-		unsigned int v2 = collapse_remap[indices[i + 2]];
+		unsigned int old0 = indices[i + 0];
+		unsigned int old1 = indices[i + 1];
+		unsigned int old2 = indices[i + 2];
+		unsigned int v0 = collapse_remap[old0];
+		unsigned int v1 = collapse_remap[old1];
+		unsigned int v2 = collapse_remap[old2];
 
 		// we never move the vertex twice during a single pass
 		assert(collapse_remap[v0] == v0);
@@ -1850,6 +1878,15 @@ static size_t remapIndexBuffer(unsigned int* indices, size_t index_count, const 
 		unsigned int r0 = remap[v0];
 		unsigned int r1 = remap[v1];
 		unsigned int r2 = remap[v2];
+
+		if (provenance)
+		{
+			// follow() reads the root before this triangle's indices are compacted in-place;
+			// degenerate triangles still update ownership before being omitted from the output
+			uniteProvenance(provenance, follow(provenance, old0), r0);
+			uniteProvenance(provenance, follow(provenance, old1), r1);
+			uniteProvenance(provenance, follow(provenance, old2), r2);
+		}
 
 		if (r0 != r1 && r0 != r2 && r1 != r2)
 		{
@@ -1882,18 +1919,6 @@ static void remapEdgeLoops(unsigned int* loop, size_t vertex_count, const unsign
 				loop[i] = r;
 		}
 	}
-}
-
-static unsigned int follow(unsigned int* parents, unsigned int index)
-{
-	while (index != parents[index])
-	{
-		unsigned int parent = parents[index];
-		parents[index] = parents[parent];
-		index = parent;
-	}
-
-	return index;
 }
 
 static size_t buildComponents(unsigned int* components, size_t vertex_count, const unsigned int* indices, size_t index_count, const unsigned int* remap)
@@ -2337,7 +2362,7 @@ enum
 	meshopt_SimplifyInternalDebug = 1 << 30
 };
 
-size_t meshopt_simplifyEdge(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_attributes_data, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* out_result_error)
+static size_t simplifyEdgeImpl(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_attributes_data, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* out_result_error, unsigned int* provenance)
 {
 	using namespace meshopt;
 
@@ -2353,6 +2378,12 @@ size_t meshopt_simplifyEdge(unsigned int* destination, const unsigned int* indic
 		assert(attribute_weights[i] >= 0);
 
 	meshopt_Allocator allocator;
+
+	if (provenance)
+	{
+		for (size_t i = 0; i < vertex_count; ++i)
+			provenance[i] = unsigned(i);
+	}
 
 	unsigned int* result = destination;
 	if (result != indices)
@@ -2374,6 +2405,13 @@ size_t meshopt_simplifyEdge(unsigned int* destination, const unsigned int* indic
 	unsigned int* remap = allocator.allocate<unsigned int>(vertex_count);
 	unsigned int* wedge = allocator.allocate<unsigned int>(vertex_count);
 	buildPositionRemap(remap, wedge, vertex_positions_data, vertex_count, vertex_positions_stride, sparse_remap, allocator);
+
+	if (provenance)
+	{
+		for (size_t i = 0; i < vertex_count; ++i)
+			if (remap[i] != i)
+				uniteProvenance(provenance, unsigned(i), remap[i]);
+	}
 
 	// classify vertices; vertex kind determines collapse rules, see kCanCollapse
 	unsigned char* vertex_kind = allocator.allocate<unsigned char>(vertex_count);
@@ -2522,6 +2560,15 @@ size_t meshopt_simplifyEdge(unsigned int* destination, const unsigned int* indic
 		if (collapses == 0)
 			break;
 
+		if (provenance)
+		{
+			// collapse_remap is rebuilt for every pass, while provenance retains roots across passes;
+			// replacing moved roots directly preserves source ownership without applying stale local edges
+			for (size_t i = 0; i < vertex_count; ++i)
+				if (collapse_remap[i] != i)
+					provenance[i] = collapse_remap[i];
+		}
+
 		updateQuadrics(collapse_remap, vertex_count, vertex_quadrics, volume_gradients, attribute_quadrics, attribute_gradients, attribute_count, vertex_positions, remap, vertex_error);
 
 		// updateQuadrics will update vertex error if we use attributes, but if we don't then result_error and vertex_error are equivalent
@@ -2533,7 +2580,7 @@ size_t meshopt_simplifyEdge(unsigned int* destination, const unsigned int* indic
 		remapEdgeLoops(loop, vertex_count, collapse_remap);
 		remapEdgeLoops(loopback, vertex_count, collapse_remap);
 
-		result_count = remapIndexBuffer(result, result_count, collapse_remap, remap);
+		result_count = remapIndexBuffer(result, result_count, collapse_remap, remap, provenance);
 
 		if ((options & meshopt_SimplifyPrune) && result_count > target_index_count && component_nexterror <= vertex_error)
 			result_count = pruneComponents(result, result_count, components, component_errors, component_count, vertex_error, component_nexterror);
@@ -2614,14 +2661,27 @@ size_t meshopt_simplifyEdge(unsigned int* destination, const unsigned int* indic
 
 	// convert resulting indices back into the dense space of the larger mesh
 	if (sparse_remap)
+	{
 		for (size_t i = 0; i < result_count; ++i)
 			result[i] = sparse_remap[result[i]];
+
+		if (provenance)
+		{
+			for (size_t i = 0; i < vertex_count; ++i)
+				provenance[i] = sparse_remap[follow(provenance, unsigned(i))];
+		}
+	}
 
 	// result_error is quadratic; we need to remap it back to linear
 	if (out_result_error)
 		*out_result_error = sqrtf(result_error) * error_scale;
 
 	return result_count;
+}
+
+size_t meshopt_simplifyEdge(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_attributes_data, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* out_result_error)
+{
+	return simplifyEdgeImpl(destination, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, vertex_attributes_data, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options, out_result_error, NULL);
 }
 
 size_t meshopt_simplify(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, size_t target_index_count, float target_error, unsigned int options, float* out_result_error)
@@ -2641,6 +2701,137 @@ size_t meshopt_simplifyWithAttributes(unsigned int* destination, const unsigned 
 size_t meshopt_simplifyWithUpdate(unsigned int* indices, size_t index_count, float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, float* vertex_attributes_data, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* out_result_error)
 {
 	return meshopt_simplifyEdge(indices, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, vertex_attributes_data, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options | meshopt_SimplifyInternalSolve, out_result_error);
+}
+
+size_t meshopt_simplifyLod(meshopt_SimplifyLodResult* result, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_attributes_data, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* result_error)
+{
+	using namespace meshopt;
+
+	assert(result);
+	assert(index_count % 3 == 0);
+	assert(vertex_positions_stride >= 12 && vertex_positions_stride <= 256);
+	assert(vertex_positions_stride % sizeof(float) == 0);
+	assert(target_index_count <= index_count);
+	assert(target_error >= 0);
+	assert(vertex_attributes_stride >= attribute_count * sizeof(float) && vertex_attributes_stride <= 256);
+	assert(vertex_attributes_stride % sizeof(float) == 0);
+	assert(attribute_count <= kMaxAttributes);
+	for (size_t i = 0; i < attribute_count; ++i)
+		assert(attribute_weights[i] >= 0);
+	assert(result->indices);
+	assert(result->vertex_remap);
+	assert(result->source_remap);
+	assert(result->source_vertices);
+
+	meshopt_Allocator allocator;
+
+	unsigned int* provenance = allocator.allocate<unsigned int>(vertex_count ? vertex_count : 1);
+
+	float lod_error = 0.f;
+	size_t result_count = simplifyEdgeImpl(result->indices, indices, index_count, vertex_positions_data, vertex_count, vertex_positions_stride, vertex_attributes_data, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options, &lod_error, provenance);
+
+	unsigned int* compact_remap = allocator.allocate<unsigned int>(vertex_count ? vertex_count : 1);
+	unsigned int* compact_indices = allocator.allocate<unsigned int>(result_count ? result_count : 1);
+	if (vertex_count)
+		memset(compact_remap, -1, vertex_count * sizeof(unsigned int));
+
+	size_t representative_vertex_count = 0;
+	for (size_t i = 0; i < result_count; ++i)
+	{
+		unsigned int vertex = result->indices[i];
+		assert(vertex < vertex_count);
+
+		if (compact_remap[vertex] == ~0u)
+			compact_remap[vertex] = unsigned(representative_vertex_count++);
+
+		compact_indices[i] = compact_remap[vertex];
+	}
+
+	unsigned int* root_to_compact = allocator.allocate<unsigned int>(vertex_count ? vertex_count : 1);
+	unsigned int* source_counts = allocator.allocate<unsigned int>(vertex_count ? vertex_count : 1);
+	unsigned int* final_vertex_remap = allocator.allocate<unsigned int>(vertex_count ? vertex_count : 1);
+	if (vertex_count)
+	{
+		memset(root_to_compact, -1, vertex_count * sizeof(unsigned int));
+		memset(source_counts, 0, vertex_count * sizeof(unsigned int));
+		memset(final_vertex_remap, -1, vertex_count * sizeof(unsigned int));
+	}
+
+	// mark roots that survive in the output before assigning gap-free compact vertex numbers
+	for (size_t i = 0; i < result_count; ++i)
+		root_to_compact[follow(provenance, result->indices[i])] = ~1u;
+
+	size_t compact_vertex_count = 0;
+
+	for (size_t i = 0; i < vertex_count; ++i)
+	{
+		unsigned int root = follow(provenance, unsigned(i));
+
+		if (root_to_compact[root] == ~1u)
+			root_to_compact[root] = unsigned(compact_vertex_count++);
+
+		final_vertex_remap[i] = root_to_compact[root];
+	}
+
+	for (size_t i = 0; i < result_count; ++i)
+	{
+		assert(compact_remap[result->indices[i]] == compact_indices[i]);
+		unsigned int compact = root_to_compact[follow(provenance, result->indices[i])];
+		assert(compact != ~0u);
+		compact_indices[i] = compact;
+	}
+
+	for (size_t i = 0; i < result_count; ++i)
+		result->indices[i] = compact_indices[i];
+
+	// retain the compact output mapping as the stable attribute reorder table
+	for (size_t i = 0; i < vertex_count; ++i)
+		result->vertex_remap[i] = final_vertex_remap[i];
+
+	result->source_remap[0] = 0;
+
+	size_t source_vertex_count = 0;
+	for (size_t i = 0; i < vertex_count; ++i)
+	{
+		if (final_vertex_remap[i] == ~0u)
+			continue;
+
+		unsigned int compact = final_vertex_remap[i];
+		assert(compact != ~0u);
+		source_counts[compact]++;
+	}
+
+	for (size_t i = 0; i < compact_vertex_count; ++i)
+	{
+		result->source_remap[i + 1] = result->source_remap[i] + source_counts[i];
+		source_vertex_count += source_counts[i];
+	}
+
+	unsigned int* source_positions = allocator.allocate<unsigned int>(compact_vertex_count ? compact_vertex_count : 1);
+	for (size_t i = 0; i < compact_vertex_count; ++i)
+		source_positions[i] = result->source_remap[i];
+
+	for (size_t i = 0; i < vertex_count; ++i)
+	{
+		if (final_vertex_remap[i] == ~0u)
+			continue;
+
+		unsigned int compact = final_vertex_remap[i];
+		assert(compact != ~0u);
+		result->source_vertices[source_positions[compact]++] = unsigned(i);
+	}
+
+	assert(source_vertex_count <= vertex_count);
+
+	result->index_count = result_count;
+	result->vertex_count = compact_vertex_count;
+	result->source_vertex_count = source_vertex_count;
+	result->result_error = lod_error;
+
+	if (result_error)
+		*result_error = lod_error;
+
+	return result_count;
 }
 
 size_t meshopt_simplifySloppy(unsigned int* destination, const unsigned int* indices, size_t index_count, const float* vertex_positions_data, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* out_result_error)

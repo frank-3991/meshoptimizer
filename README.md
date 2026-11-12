@@ -673,6 +673,8 @@ Simplification currently assumes that the input mesh is using the same material 
 
 When generating a LOD chain, you can either re-simplify each LOD from the original mesh or use the previous LOD as the starting point for the next level. The latter approach is more efficient and produces smoother visual transitions between LOD levels while preserving mesh attributes better. With this method, resulting error values from previous levels should be accumulated for LOD selection. Additionally, consider using `meshopt_SimplifySparse` to improve performance when generating deep LOD chains.
 
+When each LOD stores a compact vertex buffer, the experimental `meshopt_simplifyLod` function can produce the compact index/vertex remap together with source sets that trace every output vertex back to original input vertices. Source sets are stored as ascending ranges in `source_vertices`/`source_remap`, so they remain valid through repeated compact-and-simplify passes, duplicate position vertices, and triangles that become degenerate during a collapse. `vertex_remap` uses the same compact numbering as the output indices and can reorder each vertex attribute stream; existing single-level `meshopt_simplify*` functions keep their original output format.
+
 ### Point cloud simplification
 
 In addition to triangle mesh simplification, this library provides a function to simplify point clouds. The algorithm reduces the point cloud to a specified number of points while preserving the overall appearance, and can optionally take per-point colors into account:
@@ -1009,6 +1011,7 @@ Applications may configure the library to change the attributes of experimental 
 Currently, the following APIs are experimental:
 
 - `meshopt_SimplifyPreserveFolds` and `meshopt_SimplifyErrorClamped` flags for `meshopt_simplify*` functions
+- `meshopt_simplifyLod` function
 - `meshopt_generateNormals` function
 - `meshopt_remesh` function and `meshopt_Remesh*` flags
 - `meshopt_setAllocatorCache` function

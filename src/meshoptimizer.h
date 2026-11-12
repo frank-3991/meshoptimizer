@@ -499,6 +499,29 @@ enum
 };
 
 /**
+ * Result of a simplification pass with original vertex source tracking
+ *
+ * The index buffer uses compact vertex indices [0..vertex_count). vertex_remap maps input vertices to
+ * compact vertices and can be used with meshopt_remapVertexBuffer to reorder every vertex attribute stream.
+ * Unused input vertices contain 0xffffffff.
+ * source_remap and source_vertices describe the complete set of original input vertices represented by
+ * each compact vertex. For compact vertex i, source_vertices[source_remap[i]..source_remap[i+1]) contains
+ * the stable, ascending set of original vertex indices.
+ */
+struct meshopt_SimplifyLodResult
+{
+	unsigned int* indices;
+	unsigned int* vertex_remap;
+	unsigned int* source_remap;
+	unsigned int* source_vertices;
+	size_t index_count;
+	size_t vertex_count;
+	size_t source_vertex_count;
+	float result_error;
+};
+typedef struct meshopt_SimplifyLodResult meshopt_SimplifyLodResult;
+
+/**
  * Mesh simplifier
  * Reduces the number of triangles in the mesh, attempting to preserve mesh appearance as much as possible
  * The algorithm tries to preserve mesh topology and can stop short of the target goal based on topology constraints or target error.
@@ -562,6 +585,20 @@ MESHOPTIMIZER_API size_t meshopt_simplifyWithAttributes(unsigned int* destinatio
  * result_error can be NULL; when it's not NULL, it will contain the resulting (relative/absolute) error after simplification
  */
 MESHOPTIMIZER_API size_t meshopt_simplifyWithUpdate(unsigned int* indices, size_t index_count, float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, float* vertex_attributes, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* result_error);
+
+/**
+ * Experimental: Mesh simplifier with compact output and original vertex source sets
+ * Similar to meshopt_simplifyWithAttributes, but compacts the resulting vertices and records the original
+ * input vertices that each output vertex represents. This makes the result safe to use as the input of
+ * another simplification pass while retaining source information across an entire LOD chain.
+ *
+ * result.indices must contain enough space for the target index buffer, worst case is index_count elements.
+ * result.vertex_remap must contain enough space for vertex_count elements.
+ * result.source_remap must contain enough space for vertex_count + 1 elements.
+ * result.source_vertices must contain enough space for vertex_count elements.
+ * The other result fields are filled by the function.
+ */
+MESHOPTIMIZER_EXPERIMENTAL size_t meshopt_simplifyLod(meshopt_SimplifyLodResult* result, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_attributes, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* result_error);
 
 /**
  * Mesh simplifier (sloppy)
@@ -1138,6 +1175,8 @@ inline size_t meshopt_simplifyWithAttributes(T* destination, const T* indices, s
 template <typename T>
 inline size_t meshopt_simplifyWithUpdate(T* indices, size_t index_count, float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, float* vertex_attributes, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options = 0, float* result_error = NULL);
 template <typename T>
+inline size_t meshopt_simplifyLod(meshopt_SimplifyLodResult* result, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_attributes, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options = 0, float* result_error = NULL);
+template <typename T>
 inline size_t meshopt_simplifySloppy(T* destination, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t target_index_count, float target_error, float* result_error = NULL);
 template <typename T>
 inline size_t meshopt_simplifySloppy(T* destination, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const unsigned char* vertex_lock, size_t target_index_count, float target_error, float* result_error = NULL);
@@ -1548,6 +1587,14 @@ inline size_t meshopt_simplifyWithUpdate(T* indices, size_t index_count, float* 
 	meshopt_IndexAdapter<T> inout(indices, indices, index_count);
 
 	return meshopt_simplifyWithUpdate(inout.data, index_count, vertex_positions, vertex_count, vertex_positions_stride, vertex_attributes, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options, result_error);
+}
+
+template <typename T>
+inline size_t meshopt_simplifyLod(meshopt_SimplifyLodResult* result, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const float* vertex_attributes, size_t vertex_attributes_stride, const float* attribute_weights, size_t attribute_count, const unsigned char* vertex_lock, size_t target_index_count, float target_error, unsigned int options, float* result_error)
+{
+	meshopt_IndexAdapter<T> in(NULL, indices, index_count);
+
+	return meshopt_simplifyLod(result, in.data, index_count, vertex_positions, vertex_count, vertex_positions_stride, vertex_attributes, vertex_attributes_stride, attribute_weights, attribute_count, vertex_lock, target_index_count, target_error, options, result_error);
 }
 
 template <typename T>

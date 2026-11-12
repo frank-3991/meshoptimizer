@@ -1824,6 +1824,215 @@ static void simplify()
 	assert(memcmp(ib, expected, sizeof(expected)) == 0);
 }
 
+static void simplifyLod()
+{
+	// vertex 6 shares position with vertex 5 and is only reachable through an input degenerate triangle
+	const unsigned int ib_duplicate[] = {
+	    0, 2, 1,
+	    1, 2, 3,
+	    3, 2, 4,
+	    2, 5, 4,
+	    6, 6, 6 //
+	};
+
+	const float vb[] = {
+	    0, 4, 0,
+	    0, 1, 0,
+	    2, 2, 0,
+	    0, 0, 0,
+	    1, 0, 0,
+	    4, 0, 0,
+	    4, 0, 0 //
+	};
+
+	float attributes[7];
+	const float attribute_weights[] = {0.f};
+	for (size_t i = 0; i < 7; ++i)
+		attributes[i] = float(i);
+
+	meshopt_SimplifyLodResult lod0 = {};
+	std::vector<unsigned int> indices0(sizeof(ib_duplicate) / sizeof(unsigned int));
+	std::vector<unsigned int> vertex_remap(7);
+	std::vector<unsigned int> source_remap(8);
+	std::vector<unsigned int> source_vertices(7);
+
+	lod0.indices = &indices0[0];
+	lod0.vertex_remap = &vertex_remap[0];
+	lod0.source_remap = &source_remap[0];
+	lod0.source_vertices = &source_vertices[0];
+
+	assert(meshopt_simplifyLod(&lod0, ib_duplicate, sizeof(ib_duplicate) / sizeof(unsigned int), vb, 7, 12, attributes, sizeof(float), attribute_weights, 1, NULL, 3, 1e-2f) == 3);
+	assert(lod0.vertex_count == 3);
+	assert(lod0.index_count == 3);
+	assert(lod0.source_vertex_count == 7);
+
+	// running a less aggressive target and then the original target must keep the coarser mapping stable
+	meshopt_SimplifyLodResult partial = {};
+	std::vector<unsigned int> partial_indices(sizeof(ib_duplicate) / sizeof(unsigned int));
+	std::vector<unsigned int> partial_vertex_remap(7);
+	std::vector<unsigned int> partial_source_remap(8);
+	std::vector<unsigned int> partial_source_vertices(7);
+
+	partial.indices = &partial_indices[0];
+	partial.vertex_remap = &partial_vertex_remap[0];
+	partial.source_remap = &partial_source_remap[0];
+	partial.source_vertices = &partial_source_vertices[0];
+
+	assert(meshopt_simplifyLod(&partial, ib_duplicate, sizeof(ib_duplicate) / sizeof(unsigned int), vb, 7, 12, attributes, sizeof(float), attribute_weights, 1, NULL, 6, 1e-2f) == 6);
+	assert(partial.vertex_count >= lod0.vertex_count);
+	assert(partial.source_vertex_count == 7);
+	for (size_t i = 0; i < partial.vertex_count; ++i)
+		assert(partial_source_remap[i] < partial_source_remap[i + 1]);
+
+	for (size_t i = 0; i < lod0.index_count; ++i)
+		assert(lod0.indices[i] < lod0.vertex_count);
+
+	for (size_t i = 0; i < lod0.index_count; ++i)
+	{
+		unsigned int compact = lod0.indices[i];
+		assert(source_remap[compact] < source_remap[compact + 1]);
+	}
+
+	// all input vertices remain represented; each source set is stable and ascending
+	for (size_t i = 0; i < lod0.vertex_count; ++i)
+	{
+		assert(source_remap[i] < source_remap[i + 1]);
+		for (unsigned int j = source_remap[i] + 1; j < source_remap[i + 1]; ++j)
+			assert(source_vertices[j - 1] < source_vertices[j]);
+	}
+	assert(source_remap[0] == 0 && source_remap[lod0.vertex_count] == 7);
+
+	for (size_t i = 0; i < lod0.vertex_count; ++i)
+	{
+		for (unsigned int j = source_remap[i]; j < source_remap[i + 1]; ++j)
+			assert(vertex_remap[source_vertices[j]] == i);
+	}
+
+	// the same remap must drive both compact indices and every compacted attribute stream
+	float compact_attributes[3] = {};
+	for (size_t i = 0; i < 7; ++i)
+		if (vertex_remap[i] != ~0u)
+			compact_attributes[vertex_remap[i]] = attributes[i];
+
+	for (size_t i = 0; i < lod0.vertex_count; ++i)
+	{
+		bool matches_source = false;
+		for (unsigned int j = source_remap[i]; j < source_remap[i + 1]; ++j)
+			matches_source |= compact_attributes[i] == attributes[source_vertices[j]];
+		assert(matches_source);
+	}
+
+	// run the second LOD from compacted data and compose source tables back to the original mesh
+	float vb1[3][3];
+	for (size_t i = 0; i < lod0.vertex_count; ++i)
+		memcpy(vb1[i], vb + source_vertices[source_remap[i]] * 3, sizeof(vb1[i]));
+
+	meshopt_SimplifyLodResult lod1 = {};
+	std::vector<unsigned int> indices1(3);
+	std::vector<unsigned int> vertex_remap1(3);
+	std::vector<unsigned int> source_remap1(4);
+	std::vector<unsigned int> source_vertices1(3);
+
+	lod1.indices = &indices1[0];
+	lod1.vertex_remap = &vertex_remap1[0];
+	lod1.source_remap = &source_remap1[0];
+	lod1.source_vertices = &source_vertices1[0];
+
+	assert(meshopt_simplifyLod(&lod1, lod0.indices, lod0.index_count, &vb1[0][0], lod0.vertex_count, 12, NULL, 0, NULL, 0, NULL, 0, 1.f) == 0);
+	assert(lod1.vertex_count == 0);
+	assert(lod1.source_remap[0] == 0);
+
+	// keep another level non-empty and compose its source ranges back to the original input mesh
+	meshopt_SimplifyLodResult lod1_nonempty = {};
+	std::vector<unsigned int> indices1_nonempty(3);
+	std::vector<unsigned int> vertex_remap1_nonempty(3);
+	std::vector<unsigned int> source_remap1_nonempty(4);
+	std::vector<unsigned int> source_vertices1_nonempty(3);
+
+	lod1_nonempty.indices = &indices1_nonempty[0];
+	lod1_nonempty.vertex_remap = &vertex_remap1_nonempty[0];
+	lod1_nonempty.source_remap = &source_remap1_nonempty[0];
+	lod1_nonempty.source_vertices = &source_vertices1_nonempty[0];
+
+	assert(meshopt_simplifyLod(&lod1_nonempty, lod0.indices, lod0.index_count, &vb1[0][0], lod0.vertex_count, 12, NULL, 0, NULL, 0, NULL, 3, 1.f) == 3);
+	assert(lod1_nonempty.vertex_count <= lod0.vertex_count);
+	assert(lod1_nonempty.index_count == 3);
+
+	size_t composed_source_count = 0;
+	for (size_t i = 0; i < lod1_nonempty.vertex_count; ++i)
+	{
+		unsigned int begin = source_remap1_nonempty[i];
+		unsigned int end = source_remap1_nonempty[i + 1];
+		assert(begin < end);
+
+		for (unsigned int j = begin; j < end; ++j)
+		{
+			unsigned int level0_vertex = source_vertices1_nonempty[j];
+			assert(level0_vertex < lod0.vertex_count);
+			composed_source_count += source_remap[level0_vertex + 1] - source_remap[level0_vertex];
+		}
+	}
+	assert(composed_source_count <= 7);
+	assert(composed_source_count >= lod1_nonempty.source_vertex_count);
+
+	assert(lod1.source_vertex_count == 0);
+
+	// independent runs with the same target must produce identical source mapping
+	meshopt_SimplifyLodResult repeat = {};
+	std::vector<unsigned int> repeat_indices(sizeof(ib_duplicate) / sizeof(unsigned int));
+	std::vector<unsigned int> repeat_vertex_remap(7);
+	std::vector<unsigned int> repeat_source_remap(8);
+	std::vector<unsigned int> repeat_source_vertices(7);
+
+	repeat.indices = &repeat_indices[0];
+	repeat.vertex_remap = &repeat_vertex_remap[0];
+	repeat.source_remap = &repeat_source_remap[0];
+	repeat.source_vertices = &repeat_source_vertices[0];
+
+	assert(meshopt_simplifyLod(&repeat, ib_duplicate, sizeof(ib_duplicate) / sizeof(unsigned int), vb, 7, 12, attributes, sizeof(float), attribute_weights, 1, NULL, 3, 1e-2f) == 3);
+	assert(repeat.vertex_count == lod0.vertex_count);
+	assert(memcmp(&repeat_indices[0], &indices0[0], repeat.index_count * sizeof(unsigned int)) == 0);
+	assert(memcmp(&repeat_source_remap[0], &source_remap[0], (repeat.vertex_count + 1) * sizeof(unsigned int)) == 0);
+	assert(memcmp(&repeat_source_vertices[0], &source_vertices[0], repeat.source_vertex_count * sizeof(unsigned int)) == 0);
+
+	// pruning a disconnected component removes its triangles without attaching its vertices to another source set
+	const unsigned int prune_indices[] = {
+	    3, 2, 4,
+	    0, 2, 1,
+	    1, 2, 3,
+	    2, 5, 4,
+	    6, 7, 8 //
+	};
+
+	const float prune_positions[] = {
+	    0, 4, 0,
+	    0, 1, 0,
+	    2, 2, 0,
+	    0, 0, 0,
+	    1, 0, 0,
+	    4, 0, 0,
+	    1, 1, 1,
+	    1, 1, 1,
+	    1, 1, 1 //
+	};
+
+	meshopt_SimplifyLodResult pruned = {};
+	std::vector<unsigned int> pruned_indices_out(15);
+	std::vector<unsigned int> pruned_vertex_remap(9);
+	std::vector<unsigned int> pruned_source_remap(10);
+	std::vector<unsigned int> pruned_source_vertices(9);
+
+	pruned.indices = &pruned_indices_out[0];
+	pruned.vertex_remap = &pruned_vertex_remap[0];
+	pruned.source_remap = &pruned_source_remap[0];
+	pruned.source_vertices = &pruned_source_vertices[0];
+
+	assert(meshopt_simplifyLod(&pruned, prune_indices, 15, prune_positions, 9, 12, NULL, 0, NULL, 0, NULL, 3, 1e-2f, meshopt_SimplifyPrune) == 3);
+	assert(pruned.source_vertex_count == 6);
+	for (size_t i = 0; i < pruned.source_vertex_count; ++i)
+		assert(pruned.source_vertices[i] < 6);
+}
+
 static void simplifyStuck()
 {
 	// tetrahedron can't be simplified due to collapse error restrictions
@@ -3679,6 +3888,7 @@ void runTests()
 	emptyMesh();
 
 	simplify();
+	simplifyLod();
 	simplifyStuck();
 	simplifySloppyStuck();
 	simplifySloppyLocks();
