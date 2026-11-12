@@ -821,6 +821,43 @@ static size_t bvhCountVertices(const unsigned int* order, size_t count, short* u
 	return used_vertices;
 }
 
+static void bvhCountVerticesBoth(const unsigned int* order, size_t count, short* used, const unsigned int* indices, unsigned int* prefix, unsigned int* suffix)
+{
+	for (size_t i = 0; i < count; ++i)
+	{
+		unsigned int index = order[i];
+		unsigned int a = indices[index * 3 + 0], b = indices[index * 3 + 1], c = indices[index * 3 + 2];
+
+		prefix[i] = (i ? prefix[i - 1] : 0) + unsigned((used[a] < 0) + (used[b] < 0) + (used[c] < 0));
+		used[a] = used[b] = used[c] = 1;
+	}
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		unsigned int index = order[i];
+		unsigned int a = indices[index * 3 + 0], b = indices[index * 3 + 1], c = indices[index * 3 + 2];
+
+		used[a] = used[b] = used[c] = -1;
+	}
+
+	for (size_t i = count; i > 0; --i)
+	{
+		unsigned int index = order[i - 1];
+		unsigned int a = indices[index * 3 + 0], b = indices[index * 3 + 1], c = indices[index * 3 + 2];
+
+		suffix[i - 1] = (i == count ? 0 : suffix[i]) + unsigned((used[a] < 0) + (used[b] < 0) + (used[c] < 0));
+		used[a] = used[b] = used[c] = 1;
+	}
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		unsigned int index = order[i];
+		unsigned int a = indices[index * 3 + 0], b = indices[index * 3 + 1], c = indices[index * 3 + 2];
+
+		used[a] = used[b] = used[c] = -1;
+	}
+}
+
 static void bvhPackLeaf(unsigned char* boundary, size_t count)
 {
 	// mark meshlet boundary for future reassembly
@@ -883,7 +920,7 @@ static void bvhComputeArea(float* areas, const BVHBox* boxes, const unsigned int
 	}
 }
 
-static size_t bvhPivot(const float* areas, const unsigned int* vertices, size_t count, size_t step, size_t min, size_t max, float fill, size_t maxfill, float* out_cost)
+static size_t bvhPivot(const float* areas, const unsigned int* vertices, const unsigned int* cache_vertices, size_t count, size_t step, size_t min, size_t max, float fill, size_t maxfill, float cache_weight, float parent_area, float* out_cost)
 {
 	bool aligned = count >= min * 2 && bvhDivisible(count, min, max);
 	size_t end = aligned ? count - min : count - 1;
@@ -922,6 +959,14 @@ static size_t bvhPivot(const float* areas, const unsigned int* vertices, size_t 
 
 		cost += fill * (float(lrest) * larea + float(rrest) * rarea);
 
+		if (cache_weight > 0.f)
+		{
+			float area_scale = parent_area > 0.f ? parent_area : 1.f;
+			size_t cache_vertices_count = cache_vertices[i] + cache_vertices[count + i];
+
+			cost += cache_weight * area_scale * float(cache_vertices_count);
+		}
+
 		if (cost < bestcost)
 		{
 			bestcost = cost;
@@ -949,7 +994,7 @@ static void bvhPartition(unsigned int* target, const unsigned int* order, const 
 	assert(l == split && r == count);
 }
 
-static void bvhSplit(const BVHBox* boxes, unsigned int* orderx, unsigned int* ordery, unsigned int* orderz, unsigned char* boundary, size_t count, int depth, void* scratch, short* used, const unsigned int* indices, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight)
+static void bvhSplit(const BVHBox* boxes, unsigned int* orderx, unsigned int* ordery, unsigned int* orderz, unsigned char* boundary, size_t count, int depth, void* scratch, short* used, const unsigned int* indices, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight, float cache_weight)
 {
 	if (count <= max_triangles && bvhCountVertices(orderx, count, used, indices) <= max_vertices)
 		return bvhPackLeaf(boundary, count);
@@ -972,10 +1017,16 @@ static void bvhSplit(const BVHBox* boxes, unsigned int* orderx, unsigned int* or
 	{
 		float* areas = static_cast<float*>(scratch);
 		unsigned int* vertices = NULL;
+		unsigned int* cache_vertices = NULL;
 
 		bvhComputeArea(areas, boxes, axes[k], count);
 
-		if (count <= max_triangles)
+		if (cache_weight > 0.f)
+		{
+			cache_vertices = reinterpret_cast<unsigned int*>(areas + 2 * count);
+			bvhCountVerticesBoth(axes[k], count, used, indices, cache_vertices, cache_vertices + count);
+		}
+		else if (count <= max_triangles)
 		{
 			// for vertex bound clusters, count number of unique vertices for each split
 			vertices = reinterpret_cast<unsigned int*>(areas + 2 * count);
@@ -983,7 +1034,14 @@ static void bvhSplit(const BVHBox* boxes, unsigned int* orderx, unsigned int* or
 		}
 
 		float axiscost = FLT_MAX;
-		size_t axissplit = bvhPivot(areas, vertices, count, step, mint, max_triangles, fill_weight, maxfill, &axiscost);
+		BVHBoxT parent_box = {{FLT_MAX, FLT_MAX, FLT_MAX, 0}, {-FLT_MAX, -FLT_MAX, -FLT_MAX, 0}};
+
+		for (size_t i = 0; i < count; ++i)
+			boxMerge(parent_box, boxes[axes[k][i]]);
+
+		BVHBoxT parent_area_box = parent_box;
+		float parent_area = boxMerge(parent_area_box, BVHBox());
+		size_t axissplit = bvhPivot(areas, vertices, cache_vertices, count, step, mint, max_triangles, fill_weight, maxfill, cache_weight, parent_area, &axiscost);
 
 		if (axissplit && axiscost < bestcost)
 		{
@@ -1020,8 +1078,8 @@ static void bvhSplit(const BVHBox* boxes, unsigned int* orderx, unsigned int* or
 	}
 
 	// recursion depth is bounded due to max depth check above
-	bvhSplit(boxes, orderx, ordery, orderz, boundary, bestsplit, depth + 1, scratch, used, indices, max_vertices, min_triangles, max_triangles, fill_weight);
-	bvhSplit(boxes, orderx + bestsplit, ordery + bestsplit, orderz + bestsplit, boundary + bestsplit, count - bestsplit, depth + 1, scratch, used, indices, max_vertices, min_triangles, max_triangles, fill_weight);
+	bvhSplit(boxes, orderx, ordery, orderz, boundary, bestsplit, depth + 1, scratch, used, indices, max_vertices, min_triangles, max_triangles, fill_weight, cache_weight);
+	bvhSplit(boxes, orderx + bestsplit, ordery + bestsplit, orderz + bestsplit, boundary + bestsplit, count - bestsplit, depth + 1, scratch, used, indices, max_vertices, min_triangles, max_triangles, fill_weight, cache_weight);
 }
 
 } // namespace meshopt
@@ -1275,7 +1333,7 @@ size_t meshopt_buildMeshletsScan(meshopt_Meshlet* meshlets, unsigned int* meshle
 	return meshlet_offset;
 }
 
-size_t meshopt_buildMeshletsSpatial(struct meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight)
+static size_t buildMeshletsSpatialImpl(struct meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight, float cache_weight)
 {
 	using namespace meshopt;
 
@@ -1297,9 +1355,9 @@ size_t meshopt_buildMeshletsSpatial(struct meshopt_Meshlet* meshlets, unsigned i
 	meshopt_Allocator allocator;
 
 	// 3 floats plus 1 uint for sorting, or
-	// 2 floats plus 1 uint for pivoting, or
+	// 2 floats plus 1-2 uint arrays for pivoting, or
 	// 1 uint plus 1 byte for partitioning
-	float* scratch = allocator.allocate<float>(face_count * 4);
+	float* scratch = allocator.allocate<float>(face_count * (cache_weight > 0.f ? 6 : 4));
 
 	// compute bounding boxes and centroids for sorting
 	BVHBox* boxes = allocator.allocate<BVHBox>(face_count + 1); // padding for SIMD
@@ -1332,7 +1390,7 @@ size_t meshopt_buildMeshletsSpatial(struct meshopt_Meshlet* meshlets, unsigned i
 
 	unsigned char* boundary = allocator.allocate<unsigned char>(face_count);
 
-	bvhSplit(boxes, &axes[0], &axes[face_count], &axes[face_count * 2], boundary, face_count, 0, scratch, used, indices, max_vertices, min_triangles, max_triangles, fill_weight);
+	bvhSplit(boxes, &axes[0], &axes[face_count], &axes[face_count * 2], boundary, face_count, 0, scratch, used, indices, max_vertices, min_triangles, max_triangles, fill_weight, cache_weight);
 
 	// compute the desired number of meshlets; note that on some meshes with a lot of vertex bound clusters this might go over the bound
 	size_t meshlet_count = 0;
@@ -1344,6 +1402,19 @@ size_t meshopt_buildMeshletsSpatial(struct meshopt_Meshlet* meshlets, unsigned i
 
 	size_t meshlet_bound = meshopt_buildMeshletsBound(index_count, max_vertices, min_triangles);
 
+	// cache-driven splits can ask for more clusters than the public output bound supports
+	if (cache_weight > 0.f)
+	{
+		for (size_t i = 1; i < face_count && meshlet_count > meshlet_bound; ++i)
+		{
+			if (boundary[i])
+			{
+				boundary[i] = 0;
+				meshlet_count--;
+			}
+		}
+	}
+
 	// pack triangles into meshlets according to the order and boundaries marked by bvhSplit
 	meshopt_Meshlet meshlet = {};
 	size_t meshlet_offset = 0;
@@ -1354,8 +1425,8 @@ size_t meshopt_buildMeshletsSpatial(struct meshopt_Meshlet* meshlets, unsigned i
 		assert(boundary[i] <= 1);
 		bool split = i > 0 && boundary[i] == 1;
 
-		// while we are over the limit, we ignore boundary[] data and disable splits until we free up enough space
-		if (split && meshlet_count > meshlet_bound && meshlet_offset + meshlet_pending >= meshlet_bound)
+		// retain the original packing safeguard for unconstrained spatial clustering
+		if (cache_weight == 0.f && split && meshlet_count > meshlet_bound && meshlet_offset + meshlet_pending >= meshlet_bound)
 			split = false;
 
 		unsigned int index = axes[i];
@@ -1374,6 +1445,113 @@ size_t meshopt_buildMeshletsSpatial(struct meshopt_Meshlet* meshlets, unsigned i
 	assert(meshlet_offset <= meshlet_bound);
 	assert(meshlet.triangle_offset + meshlet.triangle_count * 3 <= index_count && meshlet.vertex_offset + meshlet.vertex_count <= index_count);
 	return meshlet_offset;
+}
+
+size_t meshopt_buildMeshletsSpatial(struct meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight)
+{
+	return buildMeshletsSpatialImpl(meshlets, meshlet_vertices, meshlet_triangles, indices, index_count, vertex_positions, vertex_count, vertex_positions_stride, max_vertices, min_triangles, max_triangles, fill_weight, 0.f);
+}
+
+static size_t countMeshletCacheCost(const meshopt_Meshlet* meshlets, size_t meshlet_count)
+{
+	size_t result = 0;
+
+	for (size_t i = 0; i < meshlet_count; ++i)
+		result += meshlets[i].vertex_count;
+
+	return result;
+}
+
+static size_t scaleCacheBudget(size_t baseline_cost, float cache_budget_factor)
+{
+	double budget = double(baseline_cost) * double(cache_budget_factor);
+
+	return budget > double(size_t(-1)) ? size_t(-1) : static_cast<size_t>(budget);
+}
+
+meshopt_MeshletBuildResult meshopt_buildMeshletsSpatialConstrained(
+	struct meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles,
+	const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count,
+	size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles,
+	float fill_weight, float cache_budget_factor, struct meshopt_MeshletBuildResult* result)
+{
+	using namespace meshopt;
+
+	assert(index_count % 3 == 0);
+	assert(vertex_positions_stride >= 12 && vertex_positions_stride <= 256);
+	assert(vertex_positions_stride % sizeof(float) == 0);
+
+	assert(max_vertices >= 3 && max_vertices <= 256);
+	assert(min_triangles >= 1 && min_triangles <= max_triangles && max_triangles <= 512);
+
+	assert(fill_weight >= 0);
+	assert(cache_budget_factor >= 1.f);
+
+	meshopt_MeshletBuildResult build_result = {};
+
+	if (index_count == 0)
+	{
+		if (result)
+			*result = build_result;
+
+		return build_result;
+	}
+
+	size_t meshlet_bound = meshopt_buildMeshletsBound(index_count, max_vertices, min_triangles);
+
+	meshopt_Allocator allocator;
+	meshopt_Meshlet* candidate_meshlets = allocator.allocate<meshopt_Meshlet>(meshlet_bound);
+	unsigned int* candidate_vertices = allocator.allocate<unsigned int>(index_count);
+	unsigned char* candidate_triangles = allocator.allocate<unsigned char>(index_count);
+
+	size_t baseline_count = meshopt_buildMeshletsScan(meshlets, meshlet_vertices, meshlet_triangles, indices, index_count, vertex_count, max_vertices, max_triangles);
+	size_t baseline_cost = countMeshletCacheCost(meshlets, baseline_count);
+	size_t cache_budget = scaleCacheBudget(baseline_cost, cache_budget_factor);
+
+	static const float cache_weights[] = {0.f, 0.01f, 0.1f, 1.f, 10.f, 100.f};
+
+	size_t best_count = 0;
+	size_t best_cost = size_t(-1);
+
+	for (size_t i = 0; i < sizeof(cache_weights) / sizeof(cache_weights[0]); ++i)
+	{
+		size_t candidate_count = buildMeshletsSpatialImpl(candidate_meshlets, candidate_vertices, candidate_triangles, indices, index_count, vertex_positions, vertex_count, vertex_positions_stride, max_vertices, min_triangles, max_triangles, fill_weight, cache_weights[i]);
+
+		size_t candidate_cost = countMeshletCacheCost(candidate_meshlets, candidate_count);
+
+		if (candidate_cost <= cache_budget && candidate_cost < best_cost)
+		{
+			best_count = candidate_count;
+			best_cost = candidate_cost;
+		}
+	}
+
+	if (best_count != 0)
+	{
+		memcpy(meshlets, candidate_meshlets, best_count * sizeof(meshopt_Meshlet));
+		memcpy(meshlet_vertices, candidate_vertices, index_count * sizeof(unsigned int));
+		memcpy(meshlet_triangles, candidate_triangles, index_count * sizeof(unsigned char));
+
+		build_result.meshlet_count = best_count;
+		build_result.cache_cost = best_cost;
+		build_result.status = meshopt_MeshletBuildStatusSpatial;
+	}
+	else
+	{
+		build_result.meshlet_count = baseline_count;
+		build_result.cache_cost = baseline_cost;
+		build_result.status = meshopt_MeshletBuildStatusBudgetFallback;
+	}
+
+	build_result.baseline_cache_cost = baseline_cost;
+
+	assert(build_result.meshlet_count <= meshlet_bound);
+	assert(build_result.cache_cost <= cache_budget);
+
+	if (result)
+		*result = build_result;
+
+	return build_result;
 }
 
 #undef SIMD_SSE

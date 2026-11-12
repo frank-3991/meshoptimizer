@@ -713,6 +713,30 @@ struct meshopt_Meshlet
 	unsigned int triangle_count;
 };
 
+typedef enum meshopt_MeshletBuildStatus
+{
+	/* spatial clustering satisfied the requested vertex cache budget */
+	meshopt_MeshletBuildStatusSpatial = 0,
+
+	/* spatial clustering exceeded the budget; scan-based clustering was returned instead */
+	meshopt_MeshletBuildStatusBudgetFallback = 1
+} meshopt_MeshletBuildStatus;
+
+typedef struct meshopt_MeshletBuildResult
+{
+	/* number of meshlets written to the output arrays */
+	size_t meshlet_count;
+
+	/* sum of vertex_count across all output meshlets; this counts vertices repeated at cluster boundaries */
+	size_t cache_cost;
+
+	/* cache cost of scan-based clustering using the original triangle order */
+	size_t baseline_cache_cost;
+
+	/* one of the meshopt_MeshletBuildStatus values */
+	int status;
+} meshopt_MeshletBuildResult;
+
 /**
  * Meshlet builder
  * Splits the mesh into a set of meshlets where each meshlet has a micro index buffer indexing into meshlet vertices that refer to the original vertex buffer
@@ -746,6 +770,21 @@ MESHOPTIMIZER_API size_t meshopt_buildMeshletsBound(size_t index_count, size_t m
  * split_factor should be set to a non-negative value; when greater than 0, clusters that have large bounds may be split unless they are under the min_triangles threshold
  */
 MESHOPTIMIZER_API size_t meshopt_buildMeshletsFlex(struct meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float cone_weight, float split_factor);
+
+/**
+ * Experimental: Meshlet builder with a relative vertex-cache cost budget
+ * This combines spatial clustering with the cache cost of scan-based clustering on the input triangle order.
+ * cache_budget_factor limits the increase in total per-cluster vertex references relative to the scan result; 1.05 allows at most 5% extra references.
+ * If no spatial result satisfies the budget, the scan result is returned and result.status is set to meshopt_MeshletBuildStatusBudgetFallback.
+ * result can be NULL when the actual cost and fallback status are not needed.
+ * Temporary memory usage is linear in the number of triangles and vertices.
+ * The directed triangle list, including duplicates and degenerate triangles, is preserved; meshlet-local indices resolve to the input global indices.
+ */
+MESHOPTIMIZER_EXPERIMENTAL meshopt_MeshletBuildResult meshopt_buildMeshletsSpatialConstrained(
+	struct meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles,
+	const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count,
+	size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles,
+	float fill_weight, float cache_budget_factor, meshopt_MeshletBuildResult* result);
 
 /**
  * Meshlet builder that produces clusters optimized for raytracing
@@ -1163,6 +1202,8 @@ template <typename T>
 inline size_t meshopt_buildMeshletsFlex(meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float cone_weight, float split_factor);
 template <typename T>
 inline size_t meshopt_buildMeshletsSpatial(meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight);
+template <typename T>
+inline meshopt_MeshletBuildResult meshopt_buildMeshletsSpatialConstrained(meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight, float cache_budget_factor, meshopt_MeshletBuildResult* result = NULL);
 template <typename T>
 inline meshopt_Bounds meshopt_computeClusterBounds(const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride);
 template <typename T>
@@ -1657,6 +1698,14 @@ inline size_t meshopt_buildMeshletsSpatial(meshopt_Meshlet* meshlets, unsigned i
 	meshopt_IndexAdapter<T> in(NULL, indices, index_count);
 
 	return meshopt_buildMeshletsSpatial(meshlets, meshlet_vertices, meshlet_triangles, in.data, index_count, vertex_positions, vertex_count, vertex_positions_stride, max_vertices, min_triangles, max_triangles, fill_weight);
+}
+
+template <typename T>
+inline meshopt_MeshletBuildResult meshopt_buildMeshletsSpatialConstrained(meshopt_Meshlet* meshlets, unsigned int* meshlet_vertices, unsigned char* meshlet_triangles, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, size_t max_vertices, size_t min_triangles, size_t max_triangles, float fill_weight, float cache_budget_factor, meshopt_MeshletBuildResult* result)
+{
+	meshopt_IndexAdapter<T> in(NULL, indices, index_count);
+
+	return meshopt_buildMeshletsSpatialConstrained(meshlets, meshlet_vertices, meshlet_triangles, in.data, index_count, vertex_positions, vertex_count, vertex_positions_stride, max_vertices, min_triangles, max_triangles, fill_weight, cache_budget_factor, result);
 }
 
 template <typename T>

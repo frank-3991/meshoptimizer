@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <vector>
 
 // This file uses assert() to verify algorithm correctness
@@ -1587,6 +1588,170 @@ static void meshletsSpatialDeep()
 
 	size_t result = meshopt_buildMeshletsSpatial(&meshlets[0], &meshlet_vertices[0], &meshlet_triangles[0], &ib[0], N * 3, &vb[0], N + 1, sizeof(float) * 3, max_vertices, max_triangles, max_triangles, 0.f);
 	assert(result == N);
+}
+
+static void meshletsSpatialConstrained()
+{
+	const int N = 8;
+	const size_t vertex_count = (N + 1) * (N + 1);
+	const size_t index_count = N * N * 6;
+	const size_t max_vertices = 16;
+	const size_t min_triangles = 8;
+	const size_t max_triangles = 16;
+
+	std::vector<float> vb(vertex_count * 3);
+	std::vector<unsigned int> ib(index_count);
+
+	for (int y = 0; y <= N; ++y)
+		for (int x = 0; x <= N; ++x)
+		{
+			size_t vertex = y * (N + 1) + x;
+
+			vb[vertex * 3 + 0] = float(x);
+			vb[vertex * 3 + 1] = float(y);
+			vb[vertex * 3 + 2] = 0.f;
+		}
+
+	for (int y = 0; y < N; ++y)
+		for (int x = 0; x < N; ++x)
+		{
+			size_t triangle = (y * N + x) * 2;
+			unsigned int a = y * (N + 1) + x;
+			unsigned int b = a + 1;
+			unsigned int c = a + (N + 1);
+			unsigned int d = c + 1;
+
+			ib[triangle * 3 + 0] = a;
+			ib[triangle * 3 + 1] = b;
+			ib[triangle * 3 + 2] = c;
+			ib[(triangle + 1) * 3 + 0] = c;
+			ib[(triangle + 1) * 3 + 1] = b;
+			ib[(triangle + 1) * 3 + 2] = d;
+		}
+
+	// include a degenerate triangle and a duplicate; both preserve their directed corners and multiplicity
+	ib.insert(ib.end(), {0, 0, 1, 0, 1, N + 1, 0, 1, N + 1});
+
+	size_t meshlet_bound = meshopt_buildMeshletsBound(ib.size(), max_vertices, min_triangles);
+
+	std::vector<meshopt_Meshlet> ml0(meshlet_bound), ml1(meshlet_bound);
+	std::vector<unsigned int> mv0(ib.size()), mv1(ib.size());
+	std::vector<unsigned char> mt0(ib.size()), mt1(ib.size());
+
+	meshopt_MeshletBuildResult r0, r1;
+	meshopt_buildMeshletsSpatialConstrained(&ml0[0], &mv0[0], &mt0[0], &ib[0], ib.size(), &vb[0], vertex_count, sizeof(float) * 3, max_vertices, min_triangles, max_triangles, 0.5f, 1.f, &r0);
+	meshopt_buildMeshletsSpatialConstrained(&ml1[0], &mv1[0], &mt1[0], &ib[0], ib.size(), &vb[0], vertex_count, sizeof(float) * 3, max_vertices, min_triangles, max_triangles, 0.5f, 1.f, &r1);
+
+	assert(r0.meshlet_count == r1.meshlet_count);
+	assert(r0.cache_cost == r1.cache_cost && r0.baseline_cache_cost == r1.baseline_cache_cost && r0.status == r1.status);
+	assert(memcmp(&ml0[0], &ml1[0], r0.meshlet_count * sizeof(meshopt_Meshlet)) == 0);
+	assert(memcmp(&mv0[0], &mv1[0], r0.cache_cost * sizeof(unsigned int)) == 0);
+	assert(memcmp(&mt0[0], &mt1[0], ib.size() * sizeof(unsigned char)) == 0);
+
+	assert(r0.cache_cost <= r0.baseline_cache_cost);
+
+	std::vector<unsigned int> input_triangles = ib;
+	std::vector<unsigned int> output_triangles;
+	output_triangles.reserve(ib.size());
+
+	size_t cache_cost = 0;
+
+	for (size_t i = 0; i < r0.meshlet_count; ++i)
+	{
+		const meshopt_Meshlet& meshlet = ml0[i];
+
+		assert(meshlet.vertex_count <= max_vertices);
+		assert(meshlet.triangle_count <= max_triangles);
+
+		cache_cost += meshlet.vertex_count;
+
+		for (size_t j = 0; j < meshlet.triangle_count; ++j)
+		{
+			unsigned int a = mv0[meshlet.vertex_offset + mt0[meshlet.triangle_offset + j * 3 + 0]];
+			unsigned int b = mv0[meshlet.vertex_offset + mt0[meshlet.triangle_offset + j * 3 + 1]];
+			unsigned int c = mv0[meshlet.vertex_offset + mt0[meshlet.triangle_offset + j * 3 + 2]];
+
+			output_triangles.push_back(a);
+			output_triangles.push_back(b);
+			output_triangles.push_back(c);
+		}
+	}
+
+	assert(cache_cost == r0.cache_cost);
+	assert(output_triangles.size() == ib.size());
+
+	std::sort(input_triangles.begin(), input_triangles.end());
+	std::sort(output_triangles.begin(), output_triangles.end());
+	assert(input_triangles == output_triangles);
+
+	// a seam creates two wedges at the same position; they must remain separate global vertex references
+	std::vector<float> seam_vb = vb;
+	seam_vb.insert(seam_vb.end(), vb.begin(), vb.begin() + 3);
+
+	unsigned int seam_vertex = unsigned(vertex_count);
+	std::vector<unsigned int> seam_ib = ib;
+	seam_ib[0] = seam_vertex;
+
+	std::vector<meshopt_Meshlet> seam_ml(meshlet_bound);
+	std::vector<unsigned int> seam_mv(seam_ib.size());
+	std::vector<unsigned char> seam_mt(seam_ib.size());
+
+	meshopt_MeshletBuildResult seam_result = meshopt_buildMeshletsSpatialConstrained(&seam_ml[0], &seam_mv[0], &seam_mt[0], &seam_ib[0], seam_ib.size(), &seam_vb[0], vertex_count + 1, sizeof(float) * 3, max_vertices, min_triangles, max_triangles, 0.5f, 1.f, 0);
+
+	bool seam_preserved = false;
+
+	for (size_t i = 0; i < seam_result.meshlet_count && !seam_preserved; ++i)
+	{
+		const meshopt_Meshlet& meshlet = seam_ml[i];
+
+		for (size_t j = 0; j < meshlet.triangle_count * 3; ++j)
+			if (seam_mv[meshlet.vertex_offset + seam_mt[meshlet.triangle_offset + j]] == seam_vertex)
+			{
+				seam_preserved = true;
+				break;
+			}
+	}
+
+	assert(seam_result.cache_cost <= seam_result.baseline_cache_cost);
+	assert(seam_preserved);
+
+	meshopt_MeshletBuildResult empty_result = meshopt_buildMeshletsSpatialConstrained(NULL, NULL, NULL, NULL, 0, &vb[0], vertex_count, sizeof(float) * 3, max_vertices, min_triangles, max_triangles, 0.5f, 1.f, 0);
+	assert(empty_result.meshlet_count == 0 && empty_result.cache_cost == 0 && empty_result.baseline_cache_cost == 0);
+	assert(empty_result.status == meshopt_MeshletBuildStatusSpatial);
+
+	// with a zero-increase budget, the result is either a spatial result within budget or the exact scan fallback
+	meshopt_MeshletBuildResult strict_result;
+	meshopt_buildMeshletsSpatialConstrained(&ml0[0], &mv0[0], &mt0[0], &ib[0], ib.size(), &vb[0], vertex_count, sizeof(float) * 3, max_vertices, min_triangles, max_triangles, 0.5f, 1.f, &strict_result);
+
+	std::vector<meshopt_Meshlet> fallback_ml(meshlet_bound);
+	std::vector<unsigned int> fallback_mv(ib.size());
+	std::vector<unsigned char> fallback_mt(ib.size());
+
+	size_t fallback_count = meshopt_buildMeshletsScan(&fallback_ml[0], &fallback_mv[0], &fallback_mt[0], &ib[0], ib.size(), vertex_count, max_vertices, max_triangles);
+
+	assert(strict_result.cache_cost <= strict_result.baseline_cache_cost);
+	assert(strict_result.baseline_cache_cost > 0);
+
+	if (strict_result.status == meshopt_MeshletBuildStatusBudgetFallback)
+	{
+		assert(strict_result.meshlet_count == fallback_count);
+		assert(memcmp(&ml0[0], &fallback_ml[0], fallback_count * sizeof(meshopt_Meshlet)) == 0);
+		assert(memcmp(&mv0[0], &fallback_mv[0], strict_result.cache_cost * sizeof(unsigned int)) == 0);
+		assert(memcmp(&mt0[0], &fallback_mt[0], ib.size() * sizeof(unsigned char)) == 0);
+	}
+	else
+	{
+		assert(strict_result.status == meshopt_MeshletBuildStatusSpatial);
+	}
+
+	meshopt_MeshletBuildResult relaxed_result;
+	meshopt_buildMeshletsSpatialConstrained(&ml0[0], &mv0[0], &mt0[0], &ib[0], ib.size(), &vb[0], vertex_count, sizeof(float) * 3, max_vertices, min_triangles, max_triangles, 0.5f, 2.f, &relaxed_result);
+
+	assert(relaxed_result.cache_cost <= relaxed_result.baseline_cache_cost * 2);
+	assert(relaxed_result.status == meshopt_MeshletBuildStatusSpatial || relaxed_result.status == meshopt_MeshletBuildStatusBudgetFallback);
+
+	meshopt_MeshletBuildResult ignored_result = meshopt_buildMeshletsSpatialConstrained(&ml0[0], &mv0[0], &mt0[0], &ib[0], ib.size(), &vb[0], vertex_count, sizeof(float) * 3, max_vertices, min_triangles, max_triangles, 0.5f, 1.f, 0);
+	assert(ignored_result.cache_cost <= ignored_result.baseline_cache_cost);
 }
 
 static void partitionBasic()
@@ -3666,6 +3831,7 @@ void runTests()
 	meshletsMax();
 	meshletsSpatial();
 	meshletsSpatialDeep();
+	meshletsSpatialConstrained();
 
 	partitionBasic();
 	partitionSpatial();

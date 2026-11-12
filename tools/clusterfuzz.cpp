@@ -1,5 +1,6 @@
 #include "../src/meshoptimizer.h"
 
+#include <assert.h>
 #include <float.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -47,6 +48,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* buffer, size_t size)
 	meshopt_buildMeshletsSpatial(ml, mv, mt, ib, indices, vb[0], 100, sizeof(float) * 4, /* max_vertices= */ 8, /* min_triangles= */ 12, /* max_triangles= */ 32, 0.f);
 	meshopt_buildMeshletsSpatial(ml, mv, mt, ib, indices, vb[0], 100, sizeof(float) * 4, /* max_vertices= */ 16, /* min_triangles= */ 16, /* max_triangles= */ 32, 0.f);
 	meshopt_buildMeshletsSpatial(ml, mv, mt, ib, indices, vb[0], 100, sizeof(float) * 4, /* max_vertices= */ 16, /* min_triangles= */ 32, /* max_triangles= */ 32, 0.f);
+
+	meshopt_MeshletBuildResult build_result;
+	meshopt_buildMeshletsSpatialConstrained(ml, mv, mt, ib, indices, vb[0], 100, sizeof(float) * 4, /* max_vertices= */ 8, /* min_triangles= */ 4, /* max_triangles= */ 32, 0.f, 1.05f, &build_result);
+	assert(build_result.meshlet_count <= meshopt_buildMeshletsBound(indices, 8, 4));
+	assert(build_result.cache_cost <= (build_result.baseline_cache_cost * 105 + 99) / 100);
+	assert(build_result.status == meshopt_MeshletBuildStatusSpatial || build_result.status == meshopt_MeshletBuildStatusBudgetFallback);
 
 	unsigned int part[333];
 	unsigned int clsize[333];
