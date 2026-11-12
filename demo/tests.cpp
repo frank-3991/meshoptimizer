@@ -1711,10 +1711,12 @@ static void remapCustom()
 
 static size_t allocCount;
 static size_t freeCount;
+static size_t outstandingCount;
 
 static void* customAlloc(size_t size)
 {
 	allocCount++;
+	outstandingCount++;
 
 	return malloc(size);
 }
@@ -1722,15 +1724,202 @@ static void* customAlloc(size_t size)
 static void customFree(void* ptr)
 {
 	freeCount++;
+	outstandingCount--;
 
 	free(ptr);
+}
+
+struct OptimizationVertex
+{
+	float position[3];
+	float normal[3];
+	float uv[2];
+};
+
+static bool sameTriangleList(std::vector<unsigned int> lhs, const std::vector<unsigned int>& rhs)
+{
+	if (lhs.size() != rhs.size())
+		return false;
+
+	for (size_t i = 0; i < rhs.size(); i += 3)
+	{
+		size_t j = 0;
+
+		for (; j < lhs.size(); j += 3)
+		{
+			if (lhs[j] == rhs[i] && lhs[j + 1] == rhs[i + 1] && lhs[j + 2] == rhs[i + 2])
+				break;
+		}
+
+		if (j == lhs.size())
+			return false;
+
+		lhs.erase(lhs.begin() + j, lhs.begin() + j + 3);
+	}
+
+	return lhs.empty();
+}
+
+static void runOptimizationPipeline(std::vector<unsigned int>& indices, std::vector<OptimizationVertex>& vertices, bool in_place)
+{
+	if (in_place)
+	{
+		std::vector<unsigned int> source_indices = indices;
+
+		meshopt_optimizeVertexCache(&indices[0], &indices[0], indices.size(), vertices.size());
+		assert(sameTriangleList(source_indices, indices));
+		meshopt_optimizeOverdraw(&indices[0], &indices[0], indices.size(), &vertices[0].position[0], vertices.size(), sizeof(OptimizationVertex), 1.05f);
+		assert(sameTriangleList(source_indices, indices));
+		size_t used_vertices = meshopt_optimizeVertexFetch(&vertices[0], &indices[0], indices.size(), &vertices[0], vertices.size(), sizeof(OptimizationVertex));
+		vertices.resize(used_vertices);
+	}
+	else
+	{
+		std::vector<unsigned int> cache_indices(indices.size());
+		std::vector<unsigned int> overdraw_indices(indices.size());
+		std::vector<OptimizationVertex> optimized_vertices(vertices.size());
+
+		meshopt_optimizeVertexCache(&cache_indices[0], &indices[0], indices.size(), vertices.size());
+		assert(sameTriangleList(indices, cache_indices));
+
+		meshopt_optimizeOverdraw(&overdraw_indices[0], &cache_indices[0], cache_indices.size(), &vertices[0].position[0], vertices.size(), sizeof(OptimizationVertex), 1.05f);
+		assert(sameTriangleList(cache_indices, overdraw_indices));
+
+		size_t used_vertices = meshopt_optimizeVertexFetch(&optimized_vertices[0], &overdraw_indices[0], overdraw_indices.size(), &vertices[0], vertices.size(), sizeof(OptimizationVertex));
+
+		for (size_t i = 0; i < overdraw_indices.size(); ++i)
+		{
+			const OptimizationVertex& result = optimized_vertices[overdraw_indices[i]];
+			const OptimizationVertex& expected = vertices[cache_indices[i]];
+			assert(memcmp(&result, &expected, sizeof(OptimizationVertex)) == 0);
+		}
+
+		indices.swap(overdraw_indices);
+		vertices.resize(used_vertices);
+		memcpy(&vertices[0], &optimized_vertices[0], used_vertices * sizeof(OptimizationVertex));
+	}
+}
+
+static void optimizationPipelineWorkspace()
+{
+	const unsigned int source_indices[] = {
+	    0, 1, 2,
+	    2, 1, 3,
+	    1, 4, 3,
+	    0, 5, 2 //
+	};
+
+	const OptimizationVertex source_vertices[] = {
+	    {{0, 0, 0}, {0, 0, 1}, {0, 0}},
+	    {{1, 0, 0}, {0, 0, 1}, {1, 0}},
+	    {{1, 1, 0}, {0, 0, 1}, {1, 1}},
+	    {{0, 1, 0}, {0, 0, 1}, {0, 1}},
+	    {{2, 0, 0}, {1, 0, 0}, {2, 0}},
+	    {{1, 1, 0}, {1, 0, 0}, {9, 9}},
+	    {{3, 3, 3}, {0, 1, 0}, {3, 3}} // unused vertex
+	};
+
+	std::vector<unsigned int> inplace_indices(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	std::vector<OptimizationVertex> inplace_vertices(source_vertices, source_vertices + sizeof(source_vertices) / sizeof(source_vertices[0]));
+
+	std::vector<unsigned int> standalone_indices = inplace_indices;
+	std::vector<OptimizationVertex> standalone_vertices = inplace_vertices;
+
+	runOptimizationPipeline(inplace_indices, inplace_vertices, true);
+	runOptimizationPipeline(standalone_indices, standalone_vertices, false);
+
+	assert(inplace_vertices.size() == 6);
+	assert(standalone_vertices.size() == inplace_vertices.size());
+	assert(inplace_indices == standalone_indices);
+	assert(memcmp(&inplace_vertices[0], &standalone_vertices[0], inplace_vertices.size() * sizeof(OptimizationVertex)) == 0);
+
+	const std::vector<unsigned int> repeated_indices = inplace_indices;
+	const std::vector<OptimizationVertex> repeated_vertices = inplace_vertices;
+
+	inplace_indices.assign(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	inplace_vertices.assign(source_vertices, source_vertices + sizeof(source_vertices) / sizeof(source_vertices[0]));
+	runOptimizationPipeline(inplace_indices, inplace_vertices, true);
+
+	assert(inplace_indices == repeated_indices);
+	assert(inplace_vertices.size() == repeated_vertices.size());
+	assert(memcmp(&inplace_vertices[0], &repeated_vertices[0], repeated_vertices.size() * sizeof(OptimizationVertex)) == 0);
+
+	// FIFO cache optimization has the same triangle-preservation guarantees but is not an input to overdraw optimization.
+	std::vector<unsigned int> fifo_indices(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	std::vector<unsigned int> expected_fifo(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	meshopt_optimizeVertexCacheFifo(&fifo_indices[0], &fifo_indices[0], fifo_indices.size(), sizeof(source_vertices) / sizeof(source_vertices[0]), 16);
+	assert(sameTriangleList(expected_fifo, fifo_indices));
+
+	std::vector<unsigned int> strip_indices(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	std::vector<unsigned int> expected_strip(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	meshopt_optimizeVertexCacheStrip(&strip_indices[0], &strip_indices[0], strip_indices.size(), sizeof(source_vertices) / sizeof(source_vertices[0]));
+	assert(sameTriangleList(expected_strip, strip_indices));
+
+	meshopt_setAllocator(customAlloc, customFree);
+
+	allocCount = freeCount = outstandingCount = 0;
+
+	inplace_indices.assign(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	inplace_vertices.assign(source_vertices, source_vertices + sizeof(source_vertices) / sizeof(source_vertices[0]));
+	runOptimizationPipeline(inplace_indices, inplace_vertices, true);
+	assert(outstandingCount == 0);
+
+	// Process a smaller mesh, including a degenerate triangle, after the larger one.
+	const unsigned int small_indices[] = {0, 1, 2, 0, 0, 1};
+	const OptimizationVertex small_vertices[] = {
+	    {{0, 0, 0}, {0, 0, 1}, {0, 0}},
+	    {{1, 0, 0}, {0, 0, 1}, {1, 0}},
+	    {{1, 1, 0}, {0, 0, 1}, {1, 1}} //
+	};
+
+	std::vector<unsigned int> degenerate_indices(small_indices, small_indices + sizeof(small_indices) / sizeof(small_indices[0]));
+	std::vector<OptimizationVertex> degenerate_vertices(small_vertices, small_vertices + sizeof(small_vertices) / sizeof(small_vertices[0]));
+	runOptimizationPipeline(degenerate_indices, degenerate_vertices, true);
+	assert(outstandingCount == 0);
+
+	std::vector<unsigned int> expected_degenerate(small_indices, small_indices + sizeof(small_indices) / sizeof(small_indices[0]));
+	assert(sameTriangleList(expected_degenerate, degenerate_indices));
+
+	// Empty index optimization meshes must return before allocating and leave the allocator balance unchanged.
+	size_t alloc_before_empty = allocCount;
+	size_t free_before_empty = freeCount;
+	meshopt_optimizeVertexCache(NULL, NULL, 0, 0);
+	meshopt_optimizeVertexCacheFifo(NULL, NULL, 0, 0, 16);
+	meshopt_optimizeOverdraw(NULL, NULL, 0, NULL, 0, 12, 1.f);
+	assert(allocCount == alloc_before_empty && freeCount == free_before_empty && outstandingCount == 0);
+
+	// Empty vertex fetch follows the existing allocator convention while still returning zero vertices.
+	size_t vertex_fetch_result = meshopt_optimizeVertexFetch(NULL, NULL, 0, NULL, 0, sizeof(float) * 3);
+	assert(vertex_fetch_result == 0);
+	assert(outstandingCount == 0);
+
+	// Repeating the large mesh must not reuse a stale mapping from the small mesh.
+	standalone_indices.assign(source_indices, source_indices + sizeof(source_indices) / sizeof(source_indices[0]));
+	standalone_vertices.assign(source_vertices, source_vertices + sizeof(source_vertices) / sizeof(source_vertices[0]));
+	runOptimizationPipeline(standalone_indices, standalone_vertices, false);
+	assert(standalone_indices == repeated_indices);
+	assert(standalone_vertices.size() == repeated_vertices.size());
+	assert(memcmp(&standalone_vertices[0], &repeated_vertices[0], repeated_vertices.size() * sizeof(OptimizationVertex)) == 0);
+	assert(outstandingCount == 0);
+
+	// The cache must be returnable only after every stage workspace has released its temporary allocations.
+	size_t cache_alloc_count = allocCount;
+	size_t cache_free_count = freeCount;
+	meshopt_setAllocatorCache(1, 4096);
+	assert(allocCount == cache_alloc_count + 1 && freeCount == cache_free_count && outstandingCount == 1);
+	meshopt_setAllocatorCache(0, 0);
+	assert(allocCount == cache_alloc_count + 1 && freeCount == cache_free_count + 1 && outstandingCount == 0);
+
+	meshopt_setAllocator(operator new, operator delete);
+
+	allocCount = freeCount = outstandingCount = 0;
 }
 
 static void customAllocator()
 {
 	meshopt_setAllocator(customAlloc, customFree);
 
-	assert(allocCount == 0 && freeCount == 0);
+	assert(allocCount == 0 && freeCount == 0 && outstandingCount == 0);
 
 	float vb[] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 	unsigned int ib[] = {0, 1, 2};
@@ -1747,18 +1936,21 @@ static void customAllocator()
 	// meshopt_optimizeVertexFetch allocates internal remap table and temporary storage for in-place remaps
 	meshopt_optimizeVertexFetch(vb, ib, 3, vb, 3, 12);
 	assert(allocCount == 3 && freeCount == 3);
+	assert(outstandingCount == 0);
 
 	// ... plus one for IndexAdapter
 	meshopt_optimizeVertexFetch(vb, ibs, 3, vb, 3, 12);
 	assert(allocCount == 6 && freeCount == 6);
+	assert(outstandingCount == 0);
 
 	meshopt_setAllocator(operator new, operator delete);
 
 	// customAlloc & customFree should not get called anymore
 	meshopt_optimizeVertexFetch(vb, ib, 3, vb, 3, 12);
 	assert(allocCount == 6 && freeCount == 6);
+	assert(outstandingCount == 0);
 
-	allocCount = freeCount = 0;
+	allocCount = freeCount = outstandingCount = 0;
 }
 
 static void customAllocatorCache()
@@ -1775,13 +1967,15 @@ static void customAllocatorCache()
 	// in-place vertex copy (36 bytes) fits into the block, remap table (12 bytes) doesn't fit after it
 	meshopt_optimizeVertexFetch(vb, ib, 3, vb, 3, 12);
 	assert(allocCount == 2 && freeCount == 1);
+	assert(outstandingCount == 1);
 
 	meshopt_setAllocatorCache(0, 0);
 	assert(allocCount == 2 && freeCount == 2);
+	assert(outstandingCount == 0);
 
 	meshopt_setAllocator(operator new, operator delete);
 
-	allocCount = freeCount = 0;
+	allocCount = freeCount = outstandingCount = 0;
 }
 
 static void emptyMesh()
@@ -3675,6 +3869,7 @@ void runTests()
 
 	customAllocator();
 	customAllocatorCache();
+	optimizationPipelineWorkspace();
 
 	emptyMesh();
 

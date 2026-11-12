@@ -38,6 +38,46 @@ struct TriangleAdjacency
 	unsigned int* data;
 };
 
+struct VertexCacheWorkspace
+{
+	meshopt_Allocator allocator;
+	TriangleAdjacency adjacency;
+
+	// The input copy is only used while destination and indices alias.
+	unsigned int* indices_copy;
+
+	// FIFO optimizer keeps a separate live triangle count because adjacency.counts is not mutated there.
+	unsigned int* live_triangles;
+	unsigned int* cache_timestamps;
+	unsigned int* dead_end;
+	unsigned char* emitted_flags;
+
+	// Generic table optimizer keeps live triangle counts by mutating adjacency.counts as triangles are emitted.
+	float* vertex_scores;
+	float* triangle_scores;
+
+	VertexCacheWorkspace()
+	    : adjacency()
+	    , indices_copy(0)
+	    , live_triangles(0)
+	    , cache_timestamps(0)
+	    , dead_end(0)
+	    , emitted_flags(0)
+	    , vertex_scores(0)
+	    , triangle_scores(0)
+	{
+	}
+
+	unsigned int* copyIndices(const unsigned int* indices, size_t index_count)
+	{
+		indices_copy = allocator.allocate<unsigned int>(index_count);
+		memcpy(indices_copy, indices, index_count * sizeof(unsigned int));
+		return indices_copy;
+	}
+
+	void buildAdjacency(const unsigned int* indices, size_t index_count, size_t vertex_count);
+};
+
 static void buildTriangleAdjacency(TriangleAdjacency& adjacency, const unsigned int* indices, size_t index_count, size_t vertex_count, meshopt_Allocator& allocator)
 {
 	size_t face_count = index_count / 3;
@@ -85,6 +125,11 @@ static void buildTriangleAdjacency(TriangleAdjacency& adjacency, const unsigned 
 
 		adjacency.offsets[i] -= adjacency.counts[i];
 	}
+}
+
+void VertexCacheWorkspace::buildAdjacency(const unsigned int* indices, size_t index_count, size_t vertex_count)
+{
+	buildTriangleAdjacency(adjacency, indices, index_count, vertex_count, allocator);
 }
 
 static unsigned int getNextVertexDeadEnd(const unsigned int* dead_end, unsigned int& dead_end_top, unsigned int& input_cursor, const unsigned int* live_triangles, size_t vertex_count)
@@ -172,18 +217,16 @@ void meshopt_optimizeVertexCacheTable(unsigned int* destination, const unsigned 
 
 	assert(index_count % 3 == 0);
 
-	meshopt_Allocator allocator;
-
 	// guard for empty meshes
 	if (index_count == 0 || vertex_count == 0)
 		return;
 
+	VertexCacheWorkspace workspace;
+
 	// support in-place optimization
 	if (destination == indices)
 	{
-		unsigned int* indices_copy = allocator.allocate<unsigned int>(index_count);
-		memcpy(indices_copy, indices, index_count * sizeof(unsigned int));
-		indices = indices_copy;
+		indices = workspace.copyIndices(indices, index_count);
 	}
 
 	unsigned int cache_size = 16;
@@ -192,24 +235,24 @@ void meshopt_optimizeVertexCacheTable(unsigned int* destination, const unsigned 
 	size_t face_count = index_count / 3;
 
 	// build adjacency information
-	TriangleAdjacency adjacency = {};
-	buildTriangleAdjacency(adjacency, indices, index_count, vertex_count, allocator);
+	workspace.buildAdjacency(indices, index_count, vertex_count);
+	TriangleAdjacency& adjacency = workspace.adjacency;
 
 	// live triangle counts; note, we alias adjacency.counts as we remove triangles after emitting them so the counts always match
 	unsigned int* live_triangles = adjacency.counts;
 
 	// emitted flags
-	unsigned char* emitted_flags = allocator.allocate<unsigned char>(face_count);
+	unsigned char* emitted_flags = workspace.emitted_flags = workspace.allocator.allocate<unsigned char>(face_count);
 	memset(emitted_flags, 0, face_count);
 
 	// compute initial vertex scores
-	float* vertex_scores = allocator.allocate<float>(vertex_count);
+	float* vertex_scores = workspace.vertex_scores = workspace.allocator.allocate<float>(vertex_count);
 
 	for (size_t i = 0; i < vertex_count; ++i)
 		vertex_scores[i] = vertexScore(table, -1, live_triangles[i]);
 
 	// compute triangle scores
-	float* triangle_scores = allocator.allocate<float>(face_count);
+	float* triangle_scores = workspace.triangle_scores = workspace.allocator.allocate<float>(face_count);
 
 	for (size_t i = 0; i < face_count; ++i)
 	{
@@ -359,40 +402,38 @@ void meshopt_optimizeVertexCacheFifo(unsigned int* destination, const unsigned i
 	assert(index_count % 3 == 0);
 	assert(cache_size >= 3);
 
-	meshopt_Allocator allocator;
-
 	// guard for empty meshes
 	if (index_count == 0 || vertex_count == 0)
 		return;
 
+	VertexCacheWorkspace workspace;
+
 	// support in-place optimization
 	if (destination == indices)
 	{
-		unsigned int* indices_copy = allocator.allocate<unsigned int>(index_count);
-		memcpy(indices_copy, indices, index_count * sizeof(unsigned int));
-		indices = indices_copy;
+		indices = workspace.copyIndices(indices, index_count);
 	}
 
 	size_t face_count = index_count / 3;
 
 	// build adjacency information
-	TriangleAdjacency adjacency = {};
-	buildTriangleAdjacency(adjacency, indices, index_count, vertex_count, allocator);
+	workspace.buildAdjacency(indices, index_count, vertex_count);
+	TriangleAdjacency& adjacency = workspace.adjacency;
 
 	// live triangle counts
-	unsigned int* live_triangles = allocator.allocate<unsigned int>(vertex_count);
+	unsigned int* live_triangles = workspace.live_triangles = workspace.allocator.allocate<unsigned int>(vertex_count);
 	memcpy(live_triangles, adjacency.counts, vertex_count * sizeof(unsigned int));
 
 	// cache time stamps
-	unsigned int* cache_timestamps = allocator.allocate<unsigned int>(vertex_count);
+	unsigned int* cache_timestamps = workspace.cache_timestamps = workspace.allocator.allocate<unsigned int>(vertex_count);
 	memset(cache_timestamps, 0, vertex_count * sizeof(unsigned int));
 
 	// dead-end stack
-	unsigned int* dead_end = allocator.allocate<unsigned int>(index_count);
+	unsigned int* dead_end = workspace.dead_end = workspace.allocator.allocate<unsigned int>(index_count);
 	unsigned int dead_end_top = 0;
 
 	// emitted flags
-	unsigned char* emitted_flags = allocator.allocate<unsigned char>(face_count);
+	unsigned char* emitted_flags = workspace.emitted_flags = workspace.allocator.allocate<unsigned char>(face_count);
 	memset(emitted_flags, 0, face_count);
 
 	unsigned int current_vertex = 0;

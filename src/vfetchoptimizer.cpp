@@ -4,6 +4,33 @@
 #include <assert.h>
 #include <string.h>
 
+namespace meshopt
+{
+
+struct VertexFetchWorkspace
+{
+	meshopt_Allocator allocator;
+
+	// The input copy is only used while destination and vertices alias.
+	unsigned char* vertices_copy;
+	unsigned int* vertex_remap;
+
+	VertexFetchWorkspace()
+	    : vertices_copy(0)
+	    , vertex_remap(0)
+	{
+	}
+
+	const unsigned char* copyVertices(const void* vertices, size_t vertex_count, size_t vertex_size)
+	{
+		vertices_copy = allocator.allocate<unsigned char>(vertex_count * vertex_size);
+		memcpy(vertices_copy, vertices, vertex_count * vertex_size);
+		return vertices_copy;
+	}
+};
+
+} // namespace meshopt
+
 size_t meshopt_optimizeVertexFetchRemap(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count)
 {
 	memset(destination, -1, vertex_count * sizeof(unsigned int));
@@ -30,18 +57,16 @@ size_t meshopt_optimizeVertexFetch(void* destination, unsigned int* indices, siz
 {
 	assert(vertex_size > 0 && vertex_size <= 256);
 
-	meshopt_Allocator allocator;
+	meshopt::VertexFetchWorkspace workspace;
 
 	// support in-place optimization
 	if (destination == vertices)
 	{
-		unsigned char* vertices_copy = allocator.allocate<unsigned char>(vertex_count * vertex_size);
-		memcpy(vertices_copy, vertices, vertex_count * vertex_size);
-		vertices = vertices_copy;
+		vertices = workspace.copyVertices(vertices, vertex_count, vertex_size);
 	}
 
 	// build vertex remap table
-	unsigned int* vertex_remap = allocator.allocate<unsigned int>(vertex_count);
+	unsigned int* vertex_remap = workspace.vertex_remap = workspace.allocator.allocate<unsigned int>(vertex_count);
 	memset(vertex_remap, -1, vertex_count * sizeof(unsigned int));
 
 	unsigned int next_vertex = 0;

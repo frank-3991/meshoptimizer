@@ -10,6 +10,38 @@
 namespace meshopt
 {
 
+struct OverdrawWorkspace
+{
+	meshopt_Allocator allocator;
+
+	// The input copy is only used while destination and indices alias.
+	unsigned int* indices_copy;
+	unsigned int* cache_timestamps;
+	unsigned int* hard_clusters;
+	unsigned int* soft_clusters;
+	float* sort_data;
+	unsigned short* sort_keys;
+	unsigned int* sort_order;
+
+	OverdrawWorkspace()
+	    : indices_copy(0)
+	    , cache_timestamps(0)
+	    , hard_clusters(0)
+	    , soft_clusters(0)
+	    , sort_data(0)
+	    , sort_keys(0)
+	    , sort_order(0)
+	{
+	}
+
+	unsigned int* copyIndices(const unsigned int* indices, size_t index_count)
+	{
+		indices_copy = allocator.allocate<unsigned int>(index_count);
+		memcpy(indices_copy, indices, index_count * sizeof(unsigned int));
+		return indices_copy;
+	}
+};
+
 static void calculateSortData(float* sort_data, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const unsigned int* clusters, size_t cluster_count)
 {
 	size_t vertex_stride_float = vertex_positions_stride / sizeof(float);
@@ -275,42 +307,40 @@ void meshopt_optimizeOverdraw(unsigned int* destination, const unsigned int* ind
 	assert(vertex_positions_stride >= 12 && vertex_positions_stride <= 256);
 	assert(vertex_positions_stride % sizeof(float) == 0);
 
-	meshopt_Allocator allocator;
-
 	// guard for empty meshes
 	if (index_count == 0 || vertex_count == 0)
 		return;
 
+	OverdrawWorkspace workspace;
+
 	// support in-place optimization
 	if (destination == indices)
 	{
-		unsigned int* indices_copy = allocator.allocate<unsigned int>(index_count);
-		memcpy(indices_copy, indices, index_count * sizeof(unsigned int));
-		indices = indices_copy;
+		indices = workspace.copyIndices(indices, index_count);
 	}
 
 	unsigned int cache_size = 16;
 
-	unsigned int* cache_timestamps = allocator.allocate<unsigned int>(vertex_count);
+	unsigned int* cache_timestamps = workspace.cache_timestamps = workspace.allocator.allocate<unsigned int>(vertex_count);
 
 	// generate hard boundaries from full-triangle cache misses
-	unsigned int* hard_clusters = allocator.allocate<unsigned int>(index_count / 3);
+	unsigned int* hard_clusters = workspace.hard_clusters = workspace.allocator.allocate<unsigned int>(index_count / 3);
 	size_t hard_cluster_count = generateHardBoundaries(hard_clusters, indices, index_count, vertex_count, cache_size, cache_timestamps);
 
 	// generate soft boundaries
-	unsigned int* soft_clusters = allocator.allocate<unsigned int>(index_count / 3 + 1);
+	unsigned int* soft_clusters = workspace.soft_clusters = workspace.allocator.allocate<unsigned int>(index_count / 3 + 1);
 	size_t soft_cluster_count = generateSoftBoundaries(soft_clusters, indices, index_count, vertex_count, hard_clusters, hard_cluster_count, cache_size, threshold, cache_timestamps);
 
 	const unsigned int* clusters = soft_clusters;
 	size_t cluster_count = soft_cluster_count;
 
 	// fill sort data
-	float* sort_data = allocator.allocate<float>(cluster_count);
+	float* sort_data = workspace.sort_data = workspace.allocator.allocate<float>(cluster_count);
 	calculateSortData(sort_data, indices, index_count, vertex_positions, vertex_count, vertex_positions_stride, clusters, cluster_count);
 
 	// sort clusters using sort data
-	unsigned short* sort_keys = allocator.allocate<unsigned short>(cluster_count);
-	unsigned int* sort_order = allocator.allocate<unsigned int>(cluster_count);
+	unsigned short* sort_keys = workspace.sort_keys = workspace.allocator.allocate<unsigned short>(cluster_count);
+	unsigned int* sort_order = workspace.sort_order = workspace.allocator.allocate<unsigned int>(cluster_count);
 	calculateSortOrderRadix(sort_order, sort_data, sort_keys, cluster_count);
 
 	// fill output buffer
