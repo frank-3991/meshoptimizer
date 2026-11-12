@@ -3236,6 +3236,267 @@ static void decodeMeshletTypical()
 	assert(memcmp(rt, triangles, sizeof(triangles)) == 0);
 }
 
+// builds a group of 4 meshlets with different capacities: normal, empty, larger, triangles-only
+static size_t meshletsGroupSetup(meshopt_Meshlet* ml, unsigned int* mv, unsigned char* mt)
+{
+	// meshlet 0: 4 vertices, 2 triangles
+	ml[0].vertex_offset = 0;
+	ml[0].triangle_offset = 0;
+	ml[0].vertex_count = 4;
+	ml[0].triangle_count = 2;
+	mv[0] = 5;
+	mv[1] = 12;
+	mv[2] = 140;
+	mv[3] = 0;
+	mt[0] = 0;
+	mt[1] = 1;
+	mt[2] = 2;
+	mt[3] = 2;
+	mt[4] = 1;
+	mt[5] = 3;
+
+	// meshlet 1: empty
+	ml[1].vertex_offset = 4;
+	ml[1].triangle_offset = 6;
+	ml[1].vertex_count = 0;
+	ml[1].triangle_count = 0;
+
+	// meshlet 2: 7 vertices, 5 triangles
+	ml[2].vertex_offset = 4;
+	ml[2].triangle_offset = 6;
+	ml[2].vertex_count = 7;
+	ml[2].triangle_count = 5;
+	mv[4] = 5;
+	mv[5] = 12;
+	mv[6] = 140;
+	mv[7] = 0;
+	mv[8] = 12389;
+	mv[9] = 123456789;
+	mv[10] = 7;
+	const unsigned char t2[5 * 3] = {0, 1, 2, 2, 1, 3, 3, 5, 4, 2, 0, 6, 6, 6, 6};
+	memcpy(mt + 6, t2, sizeof(t2));
+
+	// meshlet 3: triangles only (no vertex references)
+	ml[3].vertex_offset = 11;
+	ml[3].triangle_offset = 21;
+	ml[3].vertex_count = 0;
+	ml[3].triangle_count = 2;
+	mt[21] = 0;
+	mt[22] = 1;
+	mt[23] = 2;
+	mt[24] = 2;
+	mt[25] = 3;
+	mt[26] = 0;
+
+	return 4;
+}
+
+static unsigned int meshletsGroupRead32(const unsigned char* data)
+{
+	return (unsigned int)data[0] | ((unsigned int)data[1] << 8) | ((unsigned int)data[2] << 16) | ((unsigned int)data[3] << 24);
+}
+
+static void meshletsGroupRoundtrip()
+{
+	meshopt_Meshlet ml[4];
+	unsigned int mv[16];
+	unsigned char mt[32];
+	size_t mc = meshletsGroupSetup(ml, mv, mt);
+
+	size_t bound = meshopt_encodeMeshletsBound(mc, 8, 8);
+	std::vector<unsigned char> enc(bound);
+	size_t size = meshopt_encodeMeshlets(&enc[0], enc.size(), ml, mv, mt, mc);
+	assert(size > 0 && size <= bound);
+
+	// the buffer is too small to hold the result
+	assert(meshopt_encodeMeshlets(&enc[0], size - 1, ml, mv, mt, mc) == 0);
+
+	assert(meshopt_decodeMeshletsCount(&enc[0], size) == 4);
+
+	// each meshlet can be decoded independently, in any order
+	static const size_t order[4] = {2, 0, 3, 1};
+	for (size_t oi = 0; oi < 4; ++oi)
+	{
+		size_t i = order[oi];
+
+		size_t vc = 0, tc = 0;
+		assert(meshopt_decodeMeshletsInfo(&enc[0], size, i, &vc, &tc) == 0);
+		assert(vc == ml[i].vertex_count && tc == ml[i].triangle_count);
+
+		unsigned int rv[8];
+		unsigned char rt[8 * 3];
+		memset(rv, 0xcc, sizeof(rv));
+		memset(rt, 0xcc, sizeof(rt));
+
+		assert(meshopt_decodeMeshlets(rv, vc, rt, tc, &enc[0], size, i) == 0);
+		assert(memcmp(rv, mv + ml[i].vertex_offset, vc * sizeof(unsigned int)) == 0);
+
+		// triangles may be rotated by the encoder, but the direction and vertices must be preserved
+		for (size_t j = 0; j < tc; ++j)
+		{
+			unsigned int a = mt[ml[i].triangle_offset + j * 3 + 0];
+			unsigned int b = mt[ml[i].triangle_offset + j * 3 + 1];
+			unsigned int c = mt[ml[i].triangle_offset + j * 3 + 2];
+
+			unsigned int tri = rt[j * 3] | (rt[j * 3 + 1] << 8) | (rt[j * 3 + 2] << 16);
+			unsigned int abc = (a << 0) | (b << 8) | (c << 16);
+			unsigned int bca = (b << 0) | (c << 8) | (a << 16);
+			unsigned int cab = (c << 0) | (a << 8) | (b << 16);
+
+			assert(tri == abc || tri == bca || tri == cab);
+		}
+	}
+
+	// decoding with 16-bit vertex references and 8-bit triangle indices works as well
+	unsigned short rvs[8];
+	unsigned char rts[8 * 3];
+	assert(meshopt_decodeMeshlets(rvs, 4, rts, 2, &enc[0], size, 0) == 0);
+	for (size_t j = 0; j < 4; ++j)
+		assert(rvs[j] == mv[j]);
+	for (size_t j = 0; j < 2; ++j)
+	{
+		unsigned int a = mt[j * 3 + 0];
+		unsigned int b = mt[j * 3 + 1];
+		unsigned int c = mt[j * 3 + 2];
+
+		unsigned int tri = rts[j * 3] | (rts[j * 3 + 1] << 8) | (rts[j * 3 + 2] << 16);
+		unsigned int abc = (a << 0) | (b << 8) | (c << 16);
+		unsigned int bca = (b << 0) | (c << 8) | (a << 16);
+		unsigned int cab = (c << 0) | (a << 8) | (b << 16);
+
+		assert(tri == abc || tri == bca || tri == cab);
+	}
+
+	// out of range meshlet index is rejected
+	unsigned int rv[8];
+	unsigned char rt[8 * 3];
+	assert(meshopt_decodeMeshlets(rv, 0, rt, 0, &enc[0], size, 4) == -1);
+	assert(meshopt_decodeMeshletsInfo(&enc[0], size, 4, NULL, NULL) == -1);
+
+	// mismatched counts are rejected
+	assert(meshopt_decodeMeshlets(rv, 3, rt, 2, &enc[0], size, 0) == -1);
+	assert(meshopt_decodeMeshlets(rv, 4, rt, 3, &enc[0], size, 0) == -1);
+
+	// each payload is a regular single-meshlet encoding, decodable with meshopt_decodeMeshlet
+	unsigned int payload_offset = meshletsGroupRead32(&enc[16]);
+	unsigned int payload_size = meshletsGroupRead32(&enc[20]);
+	assert(payload_offset + payload_size <= size);
+	assert(meshopt_decodeMeshlet(rv, 4, rt, 2, &enc[payload_offset], payload_size) == 0);
+	assert(memcmp(rv, mv, 4 * sizeof(unsigned int)) == 0);
+}
+
+static void meshletsGroupDeterministic()
+{
+	meshopt_Meshlet ml[4];
+	unsigned int mv[16];
+	unsigned char mt[32];
+	size_t mc = meshletsGroupSetup(ml, mv, mt);
+
+	size_t bound = meshopt_encodeMeshletsBound(mc, 8, 8);
+	std::vector<unsigned char> enc0(bound), enc1(bound);
+	size_t size0 = meshopt_encodeMeshlets(&enc0[0], enc0.size(), ml, mv, mt, mc);
+	size_t size1 = meshopt_encodeMeshlets(&enc1[0], enc1.size(), ml, mv, mt, mc);
+
+	// encoding the same input twice produces the same data
+	assert(size0 == size1);
+	assert(memcmp(&enc0[0], &enc1[0], size0) == 0);
+}
+
+static void meshletsGroupDamage()
+{
+	meshopt_Meshlet ml[4];
+	unsigned int mv[16];
+	unsigned char mt[32];
+	size_t mc = meshletsGroupSetup(ml, mv, mt);
+
+	size_t bound = meshopt_encodeMeshletsBound(mc, 8, 8);
+	std::vector<unsigned char> enc(bound);
+	size_t size = meshopt_encodeMeshlets(&enc[0], enc.size(), ml, mv, mt, mc);
+	assert(size > 0);
+
+	unsigned int rv[8];
+	unsigned char rt[8 * 3];
+
+	// corrupting a payload byte makes that meshlet fail the integrity check, other meshlets still decode
+	{
+		std::vector<unsigned char> bad(enc.begin(), enc.begin() + size);
+		unsigned int offset2 = meshletsGroupRead32(&bad[16 + 2 * 16]);
+		bad[offset2] ^= 0x40;
+
+		memset(rv, 0xcc, sizeof(rv));
+		memset(rt, 0xcc, sizeof(rt));
+		assert(meshopt_decodeMeshlets(rv, 7, rt, 5, &bad[0], size, 2) == -4);
+
+		// the failed read preserves the caller's output
+		assert(rv[0] == 0xcccccccc && rt[0] == 0xcc);
+
+		assert(meshopt_decodeMeshlets(rv, 4, rt, 2, &bad[0], size, 0) == 0);
+		assert(memcmp(rv, mv, 4 * sizeof(unsigned int)) == 0);
+		assert(meshopt_decodeMeshlets(rv, 0, rt, 2, &bad[0], size, 3) == 0);
+	}
+
+	// truncating a payload makes that meshlet fail, other meshlets still decode
+	{
+		unsigned int offset2 = meshletsGroupRead32(&enc[16 + 2 * 16]);
+		unsigned int size2 = meshletsGroupRead32(&enc[16 + 2 * 16 + 4]);
+		size_t truncated = offset2 + size2 - 1;
+
+		memset(rv, 0xcc, sizeof(rv));
+		memset(rt, 0xcc, sizeof(rt));
+		assert(meshopt_decodeMeshlets(rv, 7, rt, 5, &enc[0], truncated, 2) == -3);
+		assert(rv[0] == 0xcccccccc && rt[0] == 0xcc);
+
+		assert(meshopt_decodeMeshlets(rv, 4, rt, 2, &enc[0], truncated, 0) == 0);
+		assert(memcmp(rv, mv, 4 * sizeof(unsigned int)) == 0);
+	}
+
+	// corrupting the directory is reported separately from payload corruption
+	{
+		std::vector<unsigned char> bad(enc.begin(), enc.begin() + size);
+		bad[16 + 1 * 16 + 8] ^= 0x01; // vertex count of meshlet 1
+
+		memset(rv, 0xcc, sizeof(rv));
+		memset(rt, 0xcc, sizeof(rt));
+		assert(meshopt_decodeMeshlets(rv, 0, rt, 0, &bad[0], size, 1) == -2);
+		assert(meshopt_decodeMeshlets(rv, 4, rt, 2, &bad[0], size, 0) == -2);
+		assert(meshopt_decodeMeshletsCount(&bad[0], size) == -2);
+		assert(meshopt_decodeMeshletsInfo(&bad[0], size, 0, NULL, NULL) == -2);
+		assert(rv[0] == 0xcccccccc && rt[0] == 0xcc);
+	}
+
+	// corrupting the header is reported as directory corruption
+	{
+		std::vector<unsigned char> bad(enc.begin(), enc.begin() + size);
+		bad[0] ^= 0x01;
+		assert(meshopt_decodeMeshletsCount(&bad[0], size) == -2);
+
+		std::vector<unsigned char> badc(enc.begin(), enc.begin() + size);
+		badc[4] ^= 0x01; // meshlet count
+		assert(meshopt_decodeMeshletsCount(&badc[0], size) == -2);
+	}
+
+	// a buffer too small to hold the directory refuses access
+	for (size_t i = 0; i < 16 + 4 * 16; ++i)
+	{
+		assert(meshopt_decodeMeshletsCount(&enc[0], i) == -2);
+		assert(meshopt_decodeMeshletsInfo(&enc[0], i, 0, NULL, NULL) == -2);
+
+		memset(rv, 0xcc, sizeof(rv));
+		memset(rt, 0xcc, sizeof(rt));
+		assert(meshopt_decodeMeshlets(rv, 4, rt, 2, &enc[0], i, 0) == -2);
+		assert(rv[0] == 0xcccccccc && rt[0] == 0xcc);
+	}
+
+	// an empty group is valid but has no meshlets to decode
+	{
+		unsigned char enc0[16];
+		size_t size0 = meshopt_encodeMeshlets(enc0, sizeof(enc0), NULL, NULL, NULL, 0);
+		assert(size0 == sizeof(enc0));
+		assert(meshopt_decodeMeshletsCount(enc0, size0) == 0);
+		assert(meshopt_decodeMeshlets(rv, 0, rt, 0, enc0, size0, 0) == -1);
+	}
+}
+
 static void opacityMap()
 {
 	const size_t triangle_count = 6;
@@ -3719,6 +3980,9 @@ void runTests()
 	decodeMeshletSafety();
 	decodeMeshletBasic();
 	decodeMeshletTypical();
+	meshletsGroupRoundtrip();
+	meshletsGroupDeterministic();
+	meshletsGroupDamage();
 
 	opacityMap();
 	opacityMapRasterize0();

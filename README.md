@@ -491,6 +491,19 @@ When using the C++ API, `meshopt_decodeMeshlet` will automatically deduce the el
 
 Decoder is heavily optimized and can directly target write-combined memory; you can expect it to run at 7-10 GB/s on modern desktop CPUs.
 
+When many meshlets need to be stored in a single stream, `meshopt_encodeMeshlets` encodes an entire array of meshlets into one buffer that contains a directory with per-meshlet payload locations and integrity hashes. Each meshlet can then be decoded independently with `meshopt_decodeMeshlets` without decoding (or even reading) the payloads of other meshlets, which is useful for streaming large geometry assets where only a subset of clusters is needed:
+
+```c++
+std::vector<unsigned char> gbuf(meshopt_encodeMeshletsBound(meshlets.size(), max_vertices, max_triangles));
+size_t gsize = meshopt_encodeMeshlets(&gbuf[0], gbuf.size(),
+    meshlets.data(), meshlet_vertices.data(), meshlet_triangles.data(), meshlets.size());
+
+// later, decode just the meshlets that are needed; query counts with meshopt_decodeMeshletsInfo
+int res = meshopt_decodeMeshlets(vertices, m.vertex_count, triangles, m.triangle_count, &gbuf[0], gsize, meshlet_index);
+```
+
+A corrupted or truncated payload only fails the decoding of the affected meshlet (with a distinct error code for payload corruption and directory corruption), and a failed decode leaves the output buffers unmodified; the number of meshlets in the group does not affect the temporary memory used to decode a single meshlet.
+
 > Applications that do most of the streaming decompression on the GPU can also decode meshlet data on the GPU if CPU decoding is inconvenient; an example [meshletdec.slang](./demo/meshletdec.slang) shader is provided for 32-bit output format, and can be easily adapted to other formats, including custom ones.
 
 Note that meshlet encoding assumes that the meshlet data was optimized; meshlets should be processed using `meshopt_optimizeMeshletLevel` with level 1 or higher (3 recommended for improved compression) before encoding. Additionally, vertex references should have a high degree of reference locality; this can be achieved by building meshlets from meshes optimized for vertex cache/fetch, or linearizing the vertex reference data and reordering the vertex buffer using `meshopt_optimizeVertexFetch`. Feeding unoptimized data into the encoder will result in poor compression ratios. Codec preserves the order of triangles, however it can rotate each triangle to improve compression ratio (which means the provoking vertex may change).

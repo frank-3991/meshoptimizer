@@ -140,6 +140,26 @@ void fuzzRoundtripMeshletV(const uint8_t* data, size_t size)
 		assert(rv2[i] == uint16_t(reinterpret_cast<const uint32_t*>(data)[i]));
 }
 
+void fuzzDecodeMeshlets(const uint8_t* data, size_t size)
+{
+	// treat the input as a meshlet group and try to decode every meshlet that the directory describes
+	int count = meshopt_decodeMeshletsCount(data, size);
+	if (count < 0)
+		return;
+
+	for (int i = 0; i < count && i < 16; ++i)
+	{
+		size_t vertex_count = 0, triangle_count = 0;
+		if (meshopt_decodeMeshletsInfo(data, size, i, &vertex_count, &triangle_count) != 0)
+			continue;
+
+		unsigned int rv[256];
+		unsigned int rt[256];
+		int rc = meshopt_decodeMeshlets(rv, vertex_count, rt, triangle_count, data, size, i);
+		(void)rc;
+	}
+}
+
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
 	// decodeIndexBuffer supports 2 and 4-byte indices
@@ -179,6 +199,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 
 	// validate that vertex data roundtrips in meshlet encoding
 	fuzzRoundtripMeshletV(data, size);
+
+	// validate that decodeMeshlets works on untrusted data and is memory safe
+	fuzzDecodeMeshlets(data, size);
 
 	return 0;
 }

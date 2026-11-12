@@ -1049,3 +1049,254 @@ int meshopt_decodeMeshletRaw(unsigned int* vertices, size_t vertex_count, unsign
 #undef SIMD_FALLBACK
 #undef SIMD_FLATTEN
 #undef SIMD_TARGET
+
+// Meshlet group format: a fixed-size header, followed by a fixed-size directory with one entry per
+// meshlet, followed by meshlet payloads in the same format that meshopt_encodeMeshlet produces.
+// The directory makes it possible to locate and decode each meshlet independently, and the hashes
+// allow the decoder to isolate corruption to individual meshlet payloads.
+//
+// Header (16 bytes):
+//   0: magic (kMeshletsMagic)
+//   4: meshlet count
+//   8: directory hash (FNV-1a hash of all directory entries)
+//  12: reserved (must be 0)
+//
+// Directory entry (16 bytes):
+//   0: payload offset (from the start of the buffer)
+//   4: payload size
+//   8: vertex count (16-bit)
+//  10: triangle count (16-bit)
+//  12: payload hash (FNV-1a hash of payload data)
+
+namespace meshopt
+{
+
+const unsigned int kMeshletsMagic = 0x4d534c31; // "MSL1"
+const size_t kMeshletsHeaderSize = 16;
+const size_t kMeshletsEntrySize = 16;
+
+static unsigned int hashMeshlets(const unsigned char* data, size_t size)
+{
+	// FNV-1a
+	unsigned int hash = 2166136261u;
+
+	for (size_t i = 0; i < size; ++i)
+		hash = (hash ^ data[i]) * 16777619u;
+
+	return hash;
+}
+
+static void writeMeshlets16(unsigned char* destination, unsigned int value)
+{
+	destination[0] = (unsigned char)(value & 0xff);
+	destination[1] = (unsigned char)((value >> 8) & 0xff);
+}
+
+static void writeMeshlets32(unsigned char* destination, unsigned int value)
+{
+	destination[0] = (unsigned char)(value & 0xff);
+	destination[1] = (unsigned char)((value >> 8) & 0xff);
+	destination[2] = (unsigned char)((value >> 16) & 0xff);
+	destination[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
+static unsigned int readMeshlets16(const unsigned char* source)
+{
+	return (unsigned int)source[0] | ((unsigned int)source[1] << 8);
+}
+
+static unsigned int readMeshlets32(const unsigned char* source)
+{
+	return (unsigned int)source[0] | ((unsigned int)source[1] << 8) | ((unsigned int)source[2] << 16) | ((unsigned int)source[3] << 24);
+}
+
+// Validates the header and the directory integrity hash; on success returns 0 and the meshlet count.
+// When the directory is missing, truncated or corrupted, the payload boundaries can not be trusted
+// so the callers must refuse access to any meshlet.
+static int readMeshletsDirectory(size_t* meshlet_count, const unsigned char* buffer, size_t buffer_size)
+{
+	if (buffer_size < kMeshletsHeaderSize)
+		return -2;
+
+	if (readMeshlets32(buffer + 0) != kMeshletsMagic)
+		return -2;
+
+	size_t count = readMeshlets32(buffer + 4);
+
+	// the directory must fit into the buffer for payload boundaries to be determinable
+	if (count > (buffer_size - kMeshletsHeaderSize) / kMeshletsEntrySize)
+		return -2;
+
+	if (readMeshlets32(buffer + 8) != hashMeshlets(buffer + kMeshletsHeaderSize, count * kMeshletsEntrySize))
+		return -2;
+
+	if (readMeshlets32(buffer + 12) != 0)
+		return -2;
+
+	*meshlet_count = count;
+	return 0;
+}
+
+} // namespace meshopt
+
+size_t meshopt_encodeMeshletsBound(size_t meshlet_count, size_t max_vertices, size_t max_triangles)
+{
+	using namespace meshopt;
+
+	size_t payload_bound = meshopt_encodeMeshletBound(max_vertices, max_triangles);
+
+	return kMeshletsHeaderSize + meshlet_count * kMeshletsEntrySize + meshlet_count * payload_bound;
+}
+
+size_t meshopt_encodeMeshlets(unsigned char* buffer, size_t buffer_size, const meshopt_Meshlet* meshlets, const unsigned int* meshlet_vertices, const unsigned char* meshlet_triangles, size_t meshlet_count)
+{
+	using namespace meshopt;
+
+	assert(meshlet_count == 0 || meshlets);
+
+	size_t directory_size = kMeshletsHeaderSize + meshlet_count * kMeshletsEntrySize;
+
+	if (buffer_size < directory_size)
+		return 0;
+
+	unsigned char* entries = buffer + kMeshletsHeaderSize;
+	unsigned char* payload = buffer + directory_size;
+	size_t payload_size = buffer_size - directory_size;
+	size_t payload_offset = directory_size;
+
+	for (size_t i = 0; i < meshlet_count; ++i)
+	{
+		const meshopt_Meshlet& m = meshlets[i];
+		assert(m.vertex_count <= 256 && m.triangle_count <= 256);
+
+		// each payload is a regular meshopt_encodeMeshlet result and can be decoded standalone
+		size_t size = meshopt_encodeMeshlet(payload, payload_size, meshlet_vertices + m.vertex_offset, m.vertex_count, meshlet_triangles + m.triangle_offset, m.triangle_count);
+		if (size == 0)
+			return 0;
+
+		// payload offsets are stored as 32-bit values
+		if (payload_offset > 0xffffffffu)
+			return 0;
+
+		unsigned char* entry = entries + i * kMeshletsEntrySize;
+		writeMeshlets32(entry + 0, (unsigned int)payload_offset);
+		writeMeshlets32(entry + 4, (unsigned int)size);
+		writeMeshlets16(entry + 8, m.vertex_count);
+		writeMeshlets16(entry + 10, m.triangle_count);
+		writeMeshlets32(entry + 12, hashMeshlets(payload, size));
+
+		payload += size;
+		payload_size -= size;
+		payload_offset += size;
+	}
+
+	writeMeshlets32(buffer + 0, kMeshletsMagic);
+	writeMeshlets32(buffer + 4, (unsigned int)meshlet_count);
+	writeMeshlets32(buffer + 8, hashMeshlets(entries, meshlet_count * kMeshletsEntrySize));
+	writeMeshlets32(buffer + 12, 0);
+
+	return payload_offset;
+}
+
+int meshopt_decodeMeshletsCount(const unsigned char* buffer, size_t buffer_size)
+{
+	using namespace meshopt;
+
+	size_t meshlet_count = 0;
+	int rc = readMeshletsDirectory(&meshlet_count, buffer, buffer_size);
+
+	return rc == 0 ? (int)meshlet_count : rc;
+}
+
+int meshopt_decodeMeshletsInfo(const unsigned char* buffer, size_t buffer_size, size_t meshlet_index, size_t* vertex_count, size_t* triangle_count)
+{
+	using namespace meshopt;
+
+	size_t meshlet_count = 0;
+	int rc = readMeshletsDirectory(&meshlet_count, buffer, buffer_size);
+	if (rc != 0)
+		return rc;
+
+	if (meshlet_index >= meshlet_count)
+		return -1;
+
+	const unsigned char* entry = buffer + kMeshletsHeaderSize + meshlet_index * kMeshletsEntrySize;
+
+	unsigned int vertices = readMeshlets16(entry + 8);
+	unsigned int triangles = readMeshlets16(entry + 10);
+
+	if (vertices > 256 || triangles > 256)
+		return -2;
+
+	if (vertex_count)
+		*vertex_count = vertices;
+	if (triangle_count)
+		*triangle_count = triangles;
+
+	return 0;
+}
+
+int meshopt_decodeMeshlets(void* vertices, size_t vertex_count, size_t vertex_size, void* triangles, size_t triangle_count, size_t triangle_size, const unsigned char* buffer, size_t buffer_size, size_t meshlet_index)
+{
+	using namespace meshopt;
+
+	assert(vertex_size == 4 || vertex_size == 2);
+	assert(triangle_size == 4 || triangle_size == 3);
+
+	if (vertex_size != 4 && vertex_size != 2)
+		return -1;
+	if (triangle_size != 4 && triangle_size != 3)
+		return -1;
+
+	size_t meshlet_count = 0;
+	int rc = readMeshletsDirectory(&meshlet_count, buffer, buffer_size);
+	if (rc != 0)
+		return rc;
+
+	if (meshlet_index >= meshlet_count)
+		return -1;
+
+	size_t directory_size = kMeshletsHeaderSize + meshlet_count * kMeshletsEntrySize;
+	const unsigned char* entry = buffer + kMeshletsHeaderSize + meshlet_index * kMeshletsEntrySize;
+
+	size_t payload_offset = readMeshlets32(entry + 0);
+	size_t payload_size = readMeshlets32(entry + 4);
+	unsigned int entry_vertices = readMeshlets16(entry + 8);
+	unsigned int entry_triangles = readMeshlets16(entry + 10);
+	unsigned int payload_hash = readMeshlets32(entry + 12);
+
+	// count and offset anomalies in the directory are reported without touching the output
+	if (entry_vertices > 256 || entry_triangles > 256)
+		return -2;
+	if (payload_offset < directory_size)
+		return -2;
+
+	// the caller must provide storage that matches the meshlet stored in the group
+	if (vertex_count != entry_vertices || triangle_count != entry_triangles)
+		return -1;
+
+	// a payload that is partially or fully outside the buffer is truncated
+	if (payload_offset > buffer_size || payload_size > buffer_size - payload_offset)
+		return -3;
+
+	const unsigned char* payload = buffer + payload_offset;
+
+	if (hashMeshlets(payload, payload_size) != payload_hash)
+		return -4;
+
+	// decode into fixed-size temporary storage so that a decoding failure leaves the caller's
+	// output unmodified; the temporary size only depends on the meshlet being decoded
+	unsigned char temp_vertices[256 * 4];
+	unsigned char temp_triangles[256 * 4];
+
+	rc = meshopt_decodeMeshlet(temp_vertices, vertex_count, vertex_size, temp_triangles, triangle_count, triangle_size, payload, payload_size);
+	if (rc != 0)
+		return -3;
+
+	if (vertex_count)
+		memcpy(vertices, temp_vertices, (vertex_count * vertex_size + 3) & ~size_t(3));
+	if (triangle_count)
+		memcpy(triangles, temp_triangles, (triangle_count * triangle_size + 3) & ~size_t(3));
+
+	return 0;
+}
