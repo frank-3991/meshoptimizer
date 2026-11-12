@@ -1298,6 +1298,225 @@ static void encodeFilterColor12()
 	assert(decoded[12] == decoded[13] && decoded[12] == decoded[14]);
 }
 
+struct ClusterBoundsError
+{
+	double residual;
+	double tolerance;
+	size_t index;
+};
+
+static const float* clusterVertex(const float* vertices, size_t vertex_stride, unsigned int index)
+{
+	return vertices + size_t(index) * (vertex_stride / sizeof(float));
+}
+
+static ClusterBoundsError clusterBoundsDiagnostic(const meshopt_Bounds& bounds, const unsigned int* indices, size_t index_count,
+                                                  const float* vertices, size_t vertex_count, size_t vertex_stride)
+{
+	assert(isfinite(bounds.center[0]) && isfinite(bounds.center[1]) && isfinite(bounds.center[2]));
+	assert(isfinite(bounds.radius) && bounds.radius >= 0.f);
+
+	ClusterBoundsError result = {0., 1e-5, 0};
+
+	for (size_t i = 0; i < index_count; ++i)
+	{
+		unsigned int index = indices[i];
+		assert(index < vertex_count);
+
+		const float* p = clusterVertex(vertices, vertex_stride, index);
+
+		double dx = double(p[0]) - double(bounds.center[0]);
+		double dy = double(p[1]) - double(bounds.center[1]);
+		double dz = double(p[2]) - double(bounds.center[2]);
+		double distance = sqrt(dx * dx + dy * dy + dz * dz);
+		double tolerance = 1e-5 * fmax(1., fabs(double(bounds.radius)));
+		double residual = distance - double(bounds.radius);
+
+		if (residual > result.residual)
+		{
+			result.residual = residual;
+			result.tolerance = tolerance;
+			result.index = i;
+		}
+	}
+
+	return result;
+}
+
+static void assertClusterContainsIndices(const meshopt_Bounds& bounds, const unsigned int* indices, size_t index_count,
+                                         const float* vertices, size_t vertex_count, size_t vertex_stride)
+{
+	ClusterBoundsError error = clusterBoundsDiagnostic(bounds, indices, index_count, vertices, vertex_count, vertex_stride);
+
+	// Rounding may leave an indexed point a very small distance outside the sphere.
+	assert(index_count == 0 || error.residual <= error.tolerance);
+}
+
+static void assertClusterMissesVertex(const meshopt_Bounds& bounds, const float* vertex)
+{
+	double dx = double(vertex[0]) - double(bounds.center[0]);
+	double dy = double(vertex[1]) - double(bounds.center[1]);
+	double dz = double(vertex[2]) - double(bounds.center[2]);
+	double tolerance = 1e-5 * fmax(1., fabs(double(bounds.radius)));
+
+	// A point omitted from the cluster must remain clearly outside, beyond any rounding allowance.
+	assert(sqrt(dx * dx + dy * dy + dz * dz) - double(bounds.radius) > tolerance * 1000.);
+}
+
+static void clusterBoundsIndexLayouts()
+{
+	const float packed[] = {
+	    0.f, 0.f, 0.f,
+	    1.f, 0.f, 0.f,
+	    0.f, 1.f, 0.f,
+	    1.f, 1.f, 0.f,
+	};
+	const float strided[] = {
+	    0.f, 0.f, 0.f, 9.f,
+	    1.f, 0.f, 0.f, 8.f,
+	    0.f, 1.f, 0.f, 7.f,
+	    1.f, 1.f, 0.f, 6.f,
+	    1e30f, 0.f, 0.f, 5.f, // not referenced by the cluster
+	};
+
+	const unsigned int packed_indices[] = {0, 1, 2, 2, 1, 3, 0, 0, 1};
+	const unsigned int strided_indices[] = {3, 2, 1, 1, 2, 3, 2, 2, 1};
+	const unsigned short short_indices[] = {3, 2, 1, 1, 2, 3, 2, 2, 1};
+	unsigned int short_indices_adapted[9];
+
+	for (size_t i = 0; i < 9; ++i)
+		short_indices_adapted[i] = short_indices[i];
+
+	meshopt_Bounds packed_bounds = meshopt_computeClusterBounds(packed_indices, 9, packed, 4, sizeof(float) * 3);
+	meshopt_Bounds strided_bounds = meshopt_computeClusterBounds(strided_indices, 9, strided, 5, sizeof(float) * 4);
+	meshopt_Bounds short_bounds = meshopt_computeClusterBounds(short_indices, 9, strided, 5, sizeof(float) * 4);
+
+	assertClusterContainsIndices(packed_bounds, packed_indices, 9, packed, 4, sizeof(float) * 3);
+	assertClusterContainsIndices(strided_bounds, strided_indices, 9, strided, 5, sizeof(float) * 4);
+	assertClusterContainsIndices(short_bounds, short_indices_adapted, 9, strided, 5, sizeof(float) * 4);
+
+	assert(memcmp(packed_bounds.center, strided_bounds.center, sizeof(packed_bounds.center)) == 0);
+	assert(packed_bounds.radius == strided_bounds.radius);
+	assert(memcmp(strided_bounds.center, short_bounds.center, sizeof(strided_bounds.center)) == 0);
+	assert(strided_bounds.radius == short_bounds.radius);
+
+	// This sphere deliberately omits index 4; the diagnostic must classify the corner as missing
+	// rather than hiding it behind the floating-point rounding allowance.
+	const unsigned int missing_indices[] = {1, 2, 1, 1, 2, 2, 2, 2, 1};
+	meshopt_Bounds missing_bounds = meshopt_computeClusterBounds(missing_indices, 9, strided, 5, sizeof(float) * 4);
+	const unsigned int all_indices[] = {1, 2, 4, 4, 2, 4, 2, 4, 1};
+	ClusterBoundsError missing_error = clusterBoundsDiagnostic(missing_bounds, all_indices, 9, strided, 5, sizeof(float) * 4);
+
+	assert(missing_error.residual > missing_error.tolerance);
+	assert(missing_error.index == 2);
+	assertClusterMissesVertex(missing_bounds, clusterVertex(strided, sizeof(float) * 4, 4));
+
+	const unsigned int unit_missing_indices[] = {0, 1, 2, 2, 1, 0, 0, 0, 1};
+	meshopt_Bounds unit_bounds = meshopt_computeClusterBounds(unit_missing_indices, 9, strided, 5, sizeof(float) * 4);
+	const float missing_vertex[3] = {3.f, 0.f, 0.f};
+	ClusterBoundsError unit_error = clusterBoundsDiagnostic(unit_bounds, missing_indices, 9, strided, 5, sizeof(float) * 4);
+
+	assert(unit_error.residual <= unit_error.tolerance);
+	assertClusterMissesVertex(unit_bounds, missing_vertex);
+	assertClusterMissesVertex(strided_bounds, clusterVertex(strided, sizeof(float) * 4, 4));
+}
+
+static void clusterBoundsDuplicatesAndDegenerate()
+{
+	const size_t stride = sizeof(float) * 3;
+	const size_t vertex_count = 513;
+	float vertices[513 * 3] = {};
+
+	vertices[512 * 3 + 0] = 1.f;
+	vertices[1 * 3 + 1] = 1.f;
+
+	// Indices 0 and 512 collide in the implementation's direct-mapped cache. Repeated and
+	// degenerate references must still preserve both vertices without reading outside the array.
+	const unsigned int duplicate_indices[] = {0, 0, 0, 512, 512, 512, 0, 512, 0, 512, 1, 0};
+	meshopt_Bounds duplicate_bounds = meshopt_computeClusterBounds(duplicate_indices, 12, vertices, vertex_count, stride);
+
+	assertClusterContainsIndices(duplicate_bounds, duplicate_indices, 12, vertices, vertex_count, stride);
+
+	const unsigned int empty_indices[1] = {0};
+	meshopt_Bounds empty_bounds = meshopt_computeClusterBounds(empty_indices, 0, vertices, vertex_count, stride);
+	meshopt_Bounds null_bounds = meshopt_computeClusterBounds(NULL, 0, NULL, 0, stride);
+
+	assertClusterContainsIndices(empty_bounds, empty_indices, 0, vertices, vertex_count, stride);
+	assert(memcmp(&empty_bounds, &null_bounds, sizeof(empty_bounds)) == 0);
+	assert(empty_bounds.center[0] == 0.f && empty_bounds.center[1] == 0.f && empty_bounds.center[2] == 0.f);
+	assert(empty_bounds.radius == 0.f && empty_bounds.cone_cutoff == 0.f && empty_bounds.cone_cutoff_s8 == 0);
+
+	const unsigned int topology_degenerate[] = {0, 0, 0, 1, 1, 1};
+	meshopt_Bounds topology_bounds = meshopt_computeClusterBounds(topology_degenerate, 6, vertices, vertex_count, stride);
+
+	assert(topology_bounds.center[0] == 0.f && topology_bounds.center[1] == 0.f && topology_bounds.center[2] == 0.f);
+	assert(topology_bounds.radius == 0.f && topology_bounds.cone_cutoff == 0.f && topology_bounds.cone_cutoff_s8 == 0);
+
+	float collinear[3 * 3] = {
+	    0.f, 0.f, 0.f,
+	    1.f, 0.f, 0.f,
+	    2.f, 0.f, 0.f,
+	};
+	const unsigned int position_degenerate[] = {0, 1, 2};
+	meshopt_Bounds position_bounds = meshopt_computeClusterBounds(position_degenerate, 3, collinear, 3, stride);
+
+	assert(position_bounds.center[0] == 0.f && position_bounds.center[1] == 0.f && position_bounds.center[2] == 0.f);
+	assert(position_bounds.radius == 0.f && position_bounds.cone_cutoff == 0.f && position_bounds.cone_cutoff_s8 == 0);
+}
+
+static void clusterBoundsExtremeAndStable()
+{
+	const size_t stride = sizeof(float) * 3;
+	const float clustered[] = {
+	    1e18f, 0.f, 0.f,
+	    1e18f, 1.f, 0.f,
+	    1e18f, 0.f, 1.f,
+	    1e18f, 0.f, 0.f, // used only by the degenerate triangle
+	};
+	const unsigned int clustered_indices[] = {0, 1, 2, 3, 3, 3};
+
+	const float wide[] = {
+	    -1e18f, 0.f, 0.f,
+	    1e18f, 0.f, 0.f,
+	    0.f, 1.f, 0.f,
+	    -1e18f, 0.f, 0.f, // used only by the degenerate triangle
+	};
+	const unsigned int wide_indices[] = {0, 1, 2, 0, 3, 3};
+
+	meshopt_Bounds clustered_bounds[3];
+	meshopt_Bounds wide_bounds[3];
+	ClusterBoundsError clustered_error[3];
+	ClusterBoundsError wide_error[3];
+
+	for (int iteration = 0; iteration < 3; ++iteration)
+	{
+		clustered_bounds[iteration] = meshopt_computeClusterBounds(clustered_indices, 6, clustered, 4, stride);
+		wide_bounds[iteration] = meshopt_computeClusterBounds(wide_indices, 6, wide, 4, stride);
+
+		clustered_error[iteration] = clusterBoundsDiagnostic(clustered_bounds[iteration], clustered_indices, 6, clustered, 4, stride);
+		wide_error[iteration] = clusterBoundsDiagnostic(wide_bounds[iteration], wide_indices, 6, wide, 4, stride);
+
+		assertClusterContainsIndices(clustered_bounds[iteration], clustered_indices, 6, clustered, 4, stride);
+		assertClusterContainsIndices(wide_bounds[iteration], wide_indices, 6, wide, 4, stride);
+
+		if (iteration > 0)
+		{
+			assert(memcmp(&clustered_bounds[iteration], &clustered_bounds[0], sizeof(meshopt_Bounds)) == 0);
+			assert(memcmp(&wide_bounds[iteration], &wide_bounds[0], sizeof(meshopt_Bounds)) == 0);
+			assert(clustered_error[iteration].residual == clustered_error[0].residual);
+			assert(wide_error[iteration].residual == wide_error[0].residual);
+			assert(clustered_error[iteration].tolerance == clustered_error[0].tolerance);
+			assert(wide_error[iteration].tolerance == wide_error[0].tolerance);
+			assert(clustered_error[iteration].index == clustered_error[0].index);
+			assert(wide_error[iteration].index == wide_error[0].index);
+		}
+	}
+
+	assert(fabs(clustered_bounds[0].center[0] - 1e18f) <= 1e3f);
+	assert(fabs(wide_bounds[0].center[0]) <= 1.f);
+	assert(wide_bounds[0].radius >= 1e18f);
+}
+
 static void clusterBoundsDegenerate()
 {
 	const float vbd[] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -3654,6 +3873,9 @@ void runTests()
 	encodeFilterColor8();
 	encodeFilterColor12();
 
+	clusterBoundsIndexLayouts();
+	clusterBoundsDuplicatesAndDegenerate();
+	clusterBoundsExtremeAndStable();
 	clusterBoundsDegenerate();
 	sphereBounds();
 
