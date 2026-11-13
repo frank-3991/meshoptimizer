@@ -260,6 +260,29 @@ MESHOPTIMIZER_API size_t meshopt_optimizeVertexFetch(void* destination, unsigned
 MESHOPTIMIZER_API size_t meshopt_optimizeVertexFetchRemap(unsigned int* destination, const unsigned int* indices, size_t index_count, size_t vertex_count);
 
 /**
+ * Experimental: stable mesh optimizer
+ * Welds vertices that are binary equivalent across all streams, reorders triangles for spatial locality and renumbers vertices in first-use order.
+ * The result is fully determined by the mesh itself: it does not depend on the input vertex numbering, triangle order or vertex storage layout
+ * (interleaved vs separate streams, stride and padding), so equivalent representations of the same mesh produce identical output.
+ * Vertices with equal positions but different attributes remain separate; triangle winding and the number of duplicate triangles are preserved.
+ * Vertices that are not referenced by the index buffer are excluded from the result.
+ *
+ * The cache cost of the resulting triangle order (ACMR with a 16-entry vertex cache) is compared against the cost of meshopt_optimizeVertexCache
+ * for the same mesh; if the cost increase exceeds max_cache_cost_ratio, the function returns 0 and leaves destination/vertex_remap unmodified.
+ *
+ * destination must contain enough space for the resulting index buffer (index_count elements)
+ * vertex_remap must contain enough space for the resulting remap table (vertex_count elements); the first N entries (N = return value) map output vertices to source vertices
+ * indices can be NULL if the input is unindexed
+ * vertex_positions should have float3 position in the first 12 bytes of each vertex; all coordinates and attributes must be finite
+ * streams describe vertex data used for equivalence; stream_count must be <= 16
+ * max_cache_cost_ratio limits the cache cost increase compared to meshopt_optimizeVertexCache (1.05 = up to 5% more)
+ *
+ * Returns the number of vertices in the resulting vertex buffer, or 0 if the cache cost budget can not be satisfied or the input is empty.
+ * The function uses temporary memory proportional to vertex_count + index_count.
+ */
+MESHOPTIMIZER_EXPERIMENTAL size_t meshopt_optimizeMeshStable(unsigned int* destination, unsigned int* vertex_remap, const unsigned int* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const struct meshopt_Stream* streams, size_t stream_count, float max_cache_cost_ratio);
+
+/**
  * Index buffer encoder
  * Encodes index data into an array of bytes that is generally much smaller (<1.5 bytes/triangle) and compresses better (<1 bytes/triangle) compared to original.
  * Input index buffer must represent a triangle list.
@@ -1121,6 +1144,8 @@ inline size_t meshopt_optimizeVertexFetchRemap(unsigned int* destination, const 
 template <typename T>
 inline size_t meshopt_optimizeVertexFetch(void* destination, T* indices, size_t index_count, const void* vertices, size_t vertex_count, size_t vertex_size);
 template <typename T>
+inline size_t meshopt_optimizeMeshStable(unsigned int* destination, unsigned int* vertex_remap, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const meshopt_Stream* streams, size_t stream_count, float max_cache_cost_ratio);
+template <typename T>
 inline size_t meshopt_encodeIndexBuffer(unsigned char* buffer, size_t buffer_size, const T* indices, size_t index_count);
 template <typename T>
 inline int meshopt_decodeIndexBuffer(T* destination, size_t index_count, const unsigned char* buffer, size_t buffer_size);
@@ -1474,6 +1499,14 @@ inline size_t meshopt_optimizeVertexFetch(void* destination, T* indices, size_t 
 	meshopt_IndexAdapter<T> inout(indices, indices, index_count);
 
 	return meshopt_optimizeVertexFetch(destination, inout.data, index_count, vertices, vertex_count, vertex_size);
+}
+
+template <typename T>
+inline size_t meshopt_optimizeMeshStable(unsigned int* destination, unsigned int* vertex_remap, const T* indices, size_t index_count, const float* vertex_positions, size_t vertex_count, size_t vertex_positions_stride, const meshopt_Stream* streams, size_t stream_count, float max_cache_cost_ratio)
+{
+	meshopt_IndexAdapter<T> in(NULL, indices, indices ? index_count : 0);
+
+	return meshopt_optimizeMeshStable(destination, vertex_remap, indices ? in.data : NULL, index_count, vertex_positions, vertex_count, vertex_positions_stride, streams, stream_count, max_cache_cost_ratio);
 }
 
 template <typename T>

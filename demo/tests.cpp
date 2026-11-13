@@ -1,5 +1,6 @@
 #include "../src/meshoptimizer.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>
@@ -1789,6 +1790,338 @@ static void emptyMesh()
 	meshopt_optimizeVertexCache(NULL, NULL, 0, 0);
 	meshopt_optimizeVertexCacheFifo(NULL, NULL, 0, 0, 16);
 	meshopt_optimizeOverdraw(NULL, NULL, 0, NULL, 0, 12, 1.f);
+}
+
+struct StableVertex
+{
+	float p[3];
+	float uv[2];
+	unsigned char pad[4];
+};
+
+static void buildStableGrid(std::vector<StableVertex>& vertices, std::vector<unsigned int>& indices, int n)
+{
+	for (int y = 0; y <= n; ++y)
+		for (int x = 0; x <= n; ++x)
+		{
+			StableVertex v = {{float(x), float(y), float((x * 7 + y * 13) % 5)}, {float(x) / n, float(y) / n}, {0, 0, 0, 0}};
+			vertices.push_back(v);
+		}
+
+	for (int y = 0; y < n; ++y)
+		for (int x = 0; x < n; ++x)
+		{
+			unsigned int a = y * (n + 1) + x, b = a + 1, c = a + (n + 1), d = c + 1;
+
+			indices.push_back(a), indices.push_back(c), indices.push_back(b);
+			indices.push_back(b), indices.push_back(c), indices.push_back(d);
+		}
+}
+
+struct StableTriangle
+{
+	unsigned int v[3];
+
+	bool operator<(const StableTriangle& other) const
+	{
+		if (v[0] != other.v[0])
+			return v[0] < other.v[0];
+		if (v[1] != other.v[1])
+			return v[1] < other.v[1];
+		return v[2] < other.v[2];
+	}
+
+	bool operator==(const StableTriangle& other) const
+	{
+		return v[0] == other.v[0] && v[1] == other.v[1] && v[2] == other.v[2];
+	}
+};
+
+static StableTriangle normalizeStableTriangle(unsigned int a, unsigned int b, unsigned int c)
+{
+	StableTriangle t = {{a, b, c}};
+	StableTriangle r1 = {{b, c, a}};
+	StableTriangle r2 = {{c, a, b}};
+
+	if (r1 < t)
+		t = r1;
+	if (r2 < t)
+		t = r2;
+
+	return t;
+}
+
+// verify that the optimized mesh has the same triangles (as directed cycles, with duplicates) as the input mesh
+static void checkStableTriangles(const unsigned int* result, const unsigned int* remap, const unsigned int* indices, size_t index_count)
+{
+	std::vector<StableTriangle> input, output;
+
+	for (size_t i = 0; i < index_count; i += 3)
+		input.push_back(normalizeStableTriangle(indices[i], indices[i + 1], indices[i + 2]));
+
+	for (size_t i = 0; i < index_count; i += 3)
+		output.push_back(normalizeStableTriangle(remap[result[i]], remap[result[i + 1]], remap[result[i + 2]]));
+
+	std::sort(input.begin(), input.end());
+	std::sort(output.begin(), output.end());
+	assert(input.size() == output.size());
+	assert(std::equal(input.begin(), input.end(), output.begin()));
+}
+
+static void optimizeMeshStableBasic()
+{
+	std::vector<StableVertex> vertices;
+	std::vector<unsigned int> indices;
+	buildStableGrid(vertices, indices, 6);
+
+	meshopt_Stream streams[] = {
+	    {vertices.data(), 12, sizeof(StableVertex)},
+	    {reinterpret_cast<unsigned char*>(vertices.data()) + 12, 8, sizeof(StableVertex)},
+	};
+
+	std::vector<unsigned int> result(indices.size());
+	std::vector<unsigned int> remap(vertices.size());
+
+	size_t count = meshopt_optimizeMeshStable(result.data(), remap.data(), indices.data(), indices.size(), vertices.data()->p, vertices.size(), sizeof(StableVertex), streams, 2, 2.0f);
+	assert(count == vertices.size());
+
+	for (size_t i = 0; i < indices.size(); ++i)
+		assert(result[i] < count);
+
+	checkStableTriangles(result.data(), remap.data(), indices.data(), indices.size());
+
+	// the resulting triangle order should be reasonably cache efficient
+	meshopt_VertexCacheStatistics stats = meshopt_analyzeVertexCache(result.data(), indices.size(), count, 16, 0, 0);
+	assert(stats.acmr < 1.0f);
+}
+
+static void optimizeMeshStableBudget()
+{
+	std::vector<StableVertex> vertices;
+	std::vector<unsigned int> indices;
+	buildStableGrid(vertices, indices, 6);
+
+	meshopt_Stream streams[] = {
+	    {vertices.data(), 12, sizeof(StableVertex)},
+	    {reinterpret_cast<unsigned char*>(vertices.data()) + 12, 8, sizeof(StableVertex)},
+	};
+
+	std::vector<unsigned int> result(indices.size(), 0xcdcdcdcd);
+	std::vector<unsigned int> remap(vertices.size(), 0xcdcdcdcd);
+
+	// the budget can not be satisfied, so the outputs must be left unmodified
+	size_t count = meshopt_optimizeMeshStable(result.data(), remap.data(), indices.data(), indices.size(), vertices.data()->p, vertices.size(), sizeof(StableVertex), streams, 2, 0.5f);
+	assert(count == 0);
+
+	for (size_t i = 0; i < indices.size(); ++i)
+		assert(result[i] == 0xcdcdcdcd);
+
+	for (size_t i = 0; i < vertices.size(); ++i)
+		assert(remap[i] == 0xcdcdcdcd);
+}
+
+static void optimizeMeshStableInvariant()
+{
+	std::vector<StableVertex> vertices;
+	std::vector<unsigned int> indices;
+	buildStableGrid(vertices, indices, 6);
+
+	size_t vertex_count = vertices.size();
+	size_t index_count = indices.size();
+
+	meshopt_Stream streams_a[] = {
+	    {vertices.data(), 12, sizeof(StableVertex)},
+	    {reinterpret_cast<unsigned char*>(vertices.data()) + 12, 8, sizeof(StableVertex)},
+	};
+
+	std::vector<unsigned int> result_a(index_count);
+	std::vector<unsigned int> remap_a(vertex_count);
+
+	size_t count_a = meshopt_optimizeMeshStable(result_a.data(), remap_a.data(), indices.data(), index_count, vertices.data()->p, vertex_count, sizeof(StableVertex), streams_a, 2, 2.0f);
+	assert(count_a == vertex_count);
+
+	// equivalent representation: separate streams with padding, permuted vertex numbering, permuted/rotated triangles, unreferenced vertices
+	size_t extra_count = 3;
+	size_t total_count = vertex_count + extra_count;
+
+	std::vector<unsigned int> perm(total_count);
+	for (size_t i = 0; i < total_count; ++i)
+		perm[i] = unsigned(i);
+
+	unsigned int lcg = 12345;
+	for (size_t i = total_count - 1; i > 0; --i)
+	{
+		lcg = lcg * 1664525 + 1013904223;
+		size_t j = lcg % (i + 1);
+		std::swap(perm[i], perm[j]);
+	}
+
+	// positions with 4 bytes of padding, uvs with 4 bytes of padding, garbage in padding
+	std::vector<unsigned char> positions(total_count * 16, 0xa5);
+	std::vector<unsigned char> uvs(total_count * 12, 0x5a);
+
+	std::vector<unsigned int> permuted_indices(index_count);
+
+	for (size_t i = 0; i < vertex_count; ++i)
+	{
+		memcpy(&positions[perm[i] * 16], vertices[i].p, 12);
+		memcpy(&uvs[perm[i] * 12], vertices[i].uv, 8);
+	}
+
+	// unreferenced vertices contain finite garbage
+	for (size_t i = 0; i < total_count; ++i)
+	{
+		bool referenced = false;
+		for (size_t j = 0; j < vertex_count; ++j)
+			referenced |= perm[j] == i;
+
+		if (!referenced)
+		{
+			float garbage_p[3] = {1000.f + float(i), 2000.f, 3000.f};
+			float garbage_uv[2] = {7.f, 8.f};
+			memcpy(&positions[i * 16], garbage_p, 12);
+			memcpy(&uvs[i * 12], garbage_uv, 8);
+		}
+	}
+
+	// permute triangle order and rotate vertices within each triangle
+	for (size_t i = 0; i < index_count / 3; ++i)
+	{
+		lcg = lcg * 1664525 + 1013904223;
+		size_t t = lcg % (index_count / 3);
+
+		unsigned int tri[3] = {indices[t * 3 + 0], indices[t * 3 + 1], indices[t * 3 + 2]};
+		indices[t * 3 + 0] = indices[i * 3 + 0], indices[t * 3 + 1] = indices[i * 3 + 1], indices[t * 3 + 2] = indices[i * 3 + 2];
+		indices[i * 3 + 0] = tri[0], indices[i * 3 + 1] = tri[1], indices[i * 3 + 2] = tri[2];
+	}
+
+	for (size_t i = 0; i < index_count; i += 3)
+	{
+		unsigned int r = unsigned(i / 3) % 3;
+		unsigned int t[3] = {perm[indices[i + r]], perm[indices[i + (r + 1) % 3]], perm[indices[i + (r + 2) % 3]]};
+		permuted_indices[i + 0] = t[0], permuted_indices[i + 1] = t[1], permuted_indices[i + 2] = t[2];
+	}
+
+	meshopt_Stream streams_b[] = {
+	    {positions.data(), 12, 16},
+	    {uvs.data(), 8, 12},
+	};
+
+	std::vector<unsigned int> result_b(index_count);
+	std::vector<unsigned int> remap_b(total_count);
+
+	size_t count_b = meshopt_optimizeMeshStable(result_b.data(), remap_b.data(), permuted_indices.data(), index_count, reinterpret_cast<float*>(positions.data()), total_count, 16, streams_b, 2, 2.0f);
+
+	// the optimized product must be identical regardless of the storage layout
+	assert(count_b == count_a);
+	assert(memcmp(result_a.data(), result_b.data(), index_count * sizeof(unsigned int)) == 0);
+
+	for (size_t i = 0; i < count_a; ++i)
+	{
+		StableVertex& va = vertices[remap_a[i]];
+
+		float pb[3], uvb[2];
+		memcpy(pb, &positions[remap_b[i] * 16], 12);
+		memcpy(uvb, &uvs[remap_b[i] * 12], 8);
+
+		assert(memcmp(va.p, pb, 12) == 0);
+		assert(memcmp(va.uv, uvb, 8) == 0);
+	}
+}
+
+static void optimizeMeshStableAttributes()
+{
+	// two quads with identical geometry but different attributes stay separate
+	StableVertex vertices[8];
+	float positions[4][3] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}};
+
+	for (int i = 0; i < 8; ++i)
+	{
+		memcpy(vertices[i].p, positions[i % 4], 12);
+		vertices[i].uv[0] = i < 4 ? 0.f : 1.f;
+		vertices[i].uv[1] = 0.f;
+		memset(vertices[i].pad, 0, 4);
+	}
+
+	unsigned int indices[] = {
+	    0, 2, 1,
+	    1, 2, 3,
+	    4, 6, 5,
+	    5, 6, 7,
+	    0, 2, 1, // duplicate triangle
+	};
+
+	meshopt_Stream streams[] = {
+	    {vertices, 12, sizeof(StableVertex)},
+	    {reinterpret_cast<unsigned char*>(vertices) + 12, 8, sizeof(StableVertex)},
+	};
+
+	unsigned int result[15];
+	unsigned int remap[8];
+
+	size_t count = meshopt_optimizeMeshStable(result, remap, indices, 15, vertices[0].p, 8, sizeof(StableVertex), streams, 2, 4.0f);
+	assert(count == 8);
+
+	checkStableTriangles(result, remap, indices, 15);
+}
+
+static void optimizeMeshStableEmpty()
+{
+	// empty meshes consistently produce an empty result
+	assert(meshopt_optimizeMeshStable(NULL, NULL, NULL, 0, NULL, 0, 12, NULL, 1, 2.0f) == 0);
+
+	StableVertex vertices[4];
+	memset(vertices, 0, sizeof(vertices));
+
+	for (int i = 0; i < 4; ++i)
+		vertices[i].p[0] = float(i);
+
+	meshopt_Stream streams[] = {
+	    {vertices, 12, sizeof(StableVertex)},
+	};
+
+	// unreferenced vertices are excluded from the result
+	unsigned int indices[] = {0, 1, 2};
+
+	unsigned int result[3];
+	unsigned int remap[4];
+
+	size_t count = meshopt_optimizeMeshStable(result, remap, indices, 3, vertices[0].p, 4, sizeof(StableVertex), streams, 1, 4.0f);
+	assert(count == 3);
+
+	// degenerate triangles are preserved
+	unsigned int indices_d[] = {0, 1, 2, 1, 1, 2, 2, 2, 2};
+
+	unsigned int result_d[9];
+	unsigned int remap_d[4];
+
+	size_t count_d = meshopt_optimizeMeshStable(result_d, remap_d, indices_d, 9, vertices[0].p, 4, sizeof(StableVertex), streams, 1, 4.0f);
+	assert(count_d == 3);
+
+	checkStableTriangles(result_d, remap_d, indices_d, 9);
+}
+
+static void optimizeMeshStableShort()
+{
+	std::vector<StableVertex> vertices;
+	std::vector<unsigned int> indices;
+	buildStableGrid(vertices, indices, 4);
+
+	std::vector<unsigned short> indices_s(indices.begin(), indices.end());
+
+	meshopt_Stream streams[] = {
+	    {vertices.data(), 12, sizeof(StableVertex)},
+	    {reinterpret_cast<unsigned char*>(vertices.data()) + 12, 8, sizeof(StableVertex)},
+	};
+
+	std::vector<unsigned int> result(indices.size());
+	std::vector<unsigned int> remap(vertices.size());
+
+	// C++ wrapper converts index data as necessary
+	size_t count = meshopt_optimizeMeshStable(result.data(), remap.data(), indices_s.data(), indices_s.size(), vertices.data()->p, vertices.size(), sizeof(StableVertex), streams, 2, 2.0f);
+	assert(count == vertices.size());
+
+	checkStableTriangles(result.data(), remap.data(), indices.data(), indices.size());
 }
 
 static void simplify()
@@ -3677,6 +4010,13 @@ void runTests()
 	customAllocatorCache();
 
 	emptyMesh();
+
+	optimizeMeshStableBasic();
+	optimizeMeshStableBudget();
+	optimizeMeshStableInvariant();
+	optimizeMeshStableAttributes();
+	optimizeMeshStableEmpty();
+	optimizeMeshStableShort();
 
 	simplify();
 	simplifyStuck();
